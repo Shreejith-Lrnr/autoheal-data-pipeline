@@ -1,0 +1,9 @@
+streamlit
+pandas
+pyodbc
+requests
+python-dotenv
+numpy
+plotly
+openpyxl
+xlrd
