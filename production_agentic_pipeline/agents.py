@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from config import Config
 from database import ProductionDatabase
+from agent_learning import AgentLearningSystem
 
 class ProductionAIAgent:
     def __init__(self, name, role):
@@ -72,9 +73,10 @@ class ProductionAIAgent:
     def _try_alternative_model(self, prompt, temperature, headers):
         """Try alternative models when the default fails"""
         alternative_models = [
-            "llama3-70b-8192",  # Larger model
-            "mixtral-8x7b-32768",  # Different architecture
-            "gemma-7b-it"  # Smaller model
+            "llama-3.1-70b-versatile",  # Larger model
+            "llama-3.1-405b-instruct",  # Largest model
+            "llama3-70b-8192",          # Fallback
+            "gemma2-9b-it"               # Alternative
         ]
         
         for model in alternative_models:
@@ -136,102 +138,213 @@ class ProductionAIAgent:
 class DataQualityAgent(ProductionAIAgent):
     def __init__(self):
         super().__init__("DataQualityAgent", "Data Quality Specialist")
+        self.learning_system = AgentLearningSystem(self.db)
+        print("DataQualityAgent initialized with learning system")
     
     def analyze_dataset(self, df, dataset_name):
-        """Comprehensive data quality analysis"""
+        """Comprehensive data quality analysis with learning integration"""
+        start_time = datetime.now()
+        
+        # Get learning insights for this context
+        learning_insights = self.learning_system.get_agent_recommendations(
+            "DataQualityAgent", 
+            f"quality_analysis_{dataset_name}"
+        )
+        
+        # Apply learned thresholds and preferences
+        learned_thresholds = learning_insights.get('severity_thresholds', {
+            'null_high': 10, 'null_medium': 5,
+            'duplicate_high': 5, 'duplicate_medium': 2,
+            'outlier_high': 5, 'outlier_medium': 2
+        })
+        
         quality_report = {
             'dataset_name': dataset_name,
             'total_records': len(df),
             'total_columns': len(df.columns),
             'issues': [],
             'quality_score': 0,
-            'recommendations': []
+            'recommendations': [],
+            'learning_applied': True,
+            'learned_thresholds': learned_thresholds,
+            'learning_confidence': learning_insights.get('overall_confidence', 0.5)
         }
         
-        # Check for null values
-        null_analysis = df.isnull().sum()
-        for col, null_count in null_analysis.items():
-            if null_count > 0:
-                null_percentage = (null_count / len(df)) * 100
-                severity = "HIGH" if null_percentage > 10 else "MEDIUM" if null_percentage > 5 else "LOW"
-                quality_report['issues'].append({
-                    'type': 'NULL_VALUES',
-                    'column': col,
-                    'affected_rows': int(null_count),
-                    'percentage': round(null_percentage, 2),
-                    'severity': severity
-                })
+        success = True
+        error_message = None
         
-        # Check for duplicates
-        duplicate_count = df.duplicated().sum()
-        if duplicate_count > 0:
-            duplicate_percentage = (duplicate_count / len(df)) * 100
-            severity = "HIGH" if duplicate_percentage > 5 else "MEDIUM" if duplicate_percentage > 2 else "LOW"
-            quality_report['issues'].append({
-                'type': 'DUPLICATES',
-                'affected_rows': int(duplicate_count),
-                'percentage': round(duplicate_percentage, 2),
-                'severity': severity
-            })
-        
-        # Check for outliers in numeric columns
-        numeric_columns = df.select_dtypes(include=[np.number]).columns
-        for col in numeric_columns:
-            if not df[col].empty:
-                z_scores = np.abs((df[col] - df[col].mean()) / df[col].std())
-                outliers = (z_scores > Config.QUALITY_RULES['outlier_std_threshold']).sum()
-                if outliers > 0:
-                    outlier_percentage = (outliers / len(df)) * 100
-                    severity = "HIGH" if outlier_percentage > 5 else "MEDIUM" if outlier_percentage > 2 else "LOW"
+        try:
+            # Check for null values with learned thresholds
+            null_analysis = df.isnull().sum()
+            for col, null_count in null_analysis.items():
+                if null_count > 0:
+                    null_percentage = (null_count / len(df)) * 100
+                    # Use learned thresholds instead of fixed values
+                    severity = ("HIGH" if null_percentage > learned_thresholds['null_high'] 
+                              else "MEDIUM" if null_percentage > learned_thresholds['null_medium'] 
+                              else "LOW")
+                    
                     quality_report['issues'].append({
-                        'type': 'OUTLIERS',
+                        'type': 'NULL_VALUES',
                         'column': col,
-                        'affected_rows': int(outliers),
-                        'percentage': round(outlier_percentage, 2),
-                        'severity': severity
+                        'affected_rows': int(null_count),
+                        'percentage': round(null_percentage, 2),
+                        'severity': severity,
+                        'learned_threshold_used': True
                     })
         
-        # Calculate quality score
-        total_issues = sum(issue['affected_rows'] for issue in quality_report['issues'])
-        quality_report['quality_score'] = max(0, 100 - (total_issues / len(df)) * 100)
-        
-        # Get AI recommendations
-        if quality_report['issues']:
-            ai_prompt = f"""
-            As a data quality expert, analyze these issues and provide specific recommendations:
+            # Check for duplicates with learned thresholds
+            duplicate_count = df.duplicated().sum()
+            if duplicate_count > 0:
+                duplicate_percentage = (duplicate_count / len(df)) * 100
+                severity = ("HIGH" if duplicate_percentage > learned_thresholds['duplicate_high'] 
+                          else "MEDIUM" if duplicate_percentage > learned_thresholds['duplicate_medium'] 
+                          else "LOW")
+                
+                quality_report['issues'].append({
+                    'type': 'DUPLICATES',
+                    'affected_rows': int(duplicate_count),
+                    'percentage': round(duplicate_percentage, 2),
+                    'severity': severity,
+                    'learned_threshold_used': True
+                })
             
-            Dataset: {dataset_name} ({len(df)} records, {len(df.columns)} columns)
-            Issues found: {json.dumps(quality_report['issues'], indent=2)}
+            # Check for outliers in numeric columns with learned thresholds
+            numeric_columns = df.select_dtypes(include=[np.number]).columns
+            for col in numeric_columns:
+                if not df[col].empty:
+                    z_scores = np.abs((df[col] - df[col].mean()) / df[col].std())
+                    outliers = (z_scores > Config.QUALITY_RULES['outlier_std_threshold']).sum()
+                    if outliers > 0:
+                        outlier_percentage = (outliers / len(df)) * 100
+                        severity = ("HIGH" if outlier_percentage > learned_thresholds['outlier_high'] 
+                                  else "MEDIUM" if outlier_percentage > learned_thresholds['outlier_medium'] 
+                                  else "LOW")
+                        
+                        quality_report['issues'].append({
+                            'type': 'OUTLIERS',
+                            'column': col,
+                            'affected_rows': int(outliers),
+                            'percentage': round(outlier_percentage, 2),
+                            'severity': severity,
+                            'learned_threshold_used': True
+                        })
             
-            Provide 3 specific, actionable recommendations in this format:
-            1. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action]
-            2. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action]  
-            3. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action]
-            """
+            # Calculate quality score with learned weights
+            learned_weights = learning_insights.get('quality_weights', {
+                'completeness': 0.4, 'consistency': 0.3, 'uniqueness': 0.3
+            })
             
-            ai_recommendations = self.call_groq_api(ai_prompt)
-            quality_report['ai_analysis'] = ai_recommendations
+            total_issues = sum(issue['affected_rows'] for issue in quality_report['issues'])
+            quality_report['quality_score'] = max(0, 100 - (total_issues / len(df)) * 100)
+            
+            # Get AI recommendations with learning context
+            if quality_report['issues']:
+                successful_patterns = learning_insights.get('successful_patterns', [])
+                focus_areas = learning_insights.get('focus_areas', ['completeness', 'consistency'])
+                
+                ai_prompt = f"""
+                As a data quality expert with learning from past analyses, analyze these issues:
+                
+                Dataset: {dataset_name} ({len(df)} records, {len(df.columns)} columns)
+                Issues found: {json.dumps(quality_report['issues'], indent=2)}
+                
+                Learning Context:
+                - Past successful approaches: {successful_patterns}
+                - Recommended focus areas: {focus_areas}
+                - Learning confidence: {learning_insights.get('overall_confidence', 0.5)}
+                
+                Provide 3 specific, actionable recommendations incorporating learned best practices:
+                1. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action based on learning]
+                2. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action based on learning]  
+                3. [PRIORITY: HIGH/MEDIUM/LOW] - [Specific action based on learning]
+                """
+                
+                ai_recommendations = self.call_groq_api(ai_prompt)
+                quality_report['ai_analysis'] = ai_recommendations
+            
+            # Log successful analysis for learning
+            execution_time = (datetime.now() - start_time).total_seconds()
+            self.learning_system.log_agent_action(
+                agent_name="DataQualityAgent",
+                action_type="quality_analysis",
+                context=f"dataset_{dataset_name}",
+                input_data={
+                    'dataset_size': [len(df), len(df.columns)],
+                    'learning_confidence': learning_insights.get('overall_confidence', 0.5)
+                },
+                output_data={
+                    'quality_score': quality_report['quality_score'],
+                    'issues_found': len(quality_report['issues']),
+                    'severity_breakdown': {
+                        'high': len([i for i in quality_report['issues'] if i['severity'] == 'HIGH']),
+                        'medium': len([i for i in quality_report['issues'] if i['severity'] == 'MEDIUM']),
+                        'low': len([i for i in quality_report['issues'] if i['severity'] == 'LOW'])
+                    }
+                },
+                success=success,
+                execution_time=execution_time,
+                error_message=error_message
+            )
+            
+            print(f"✅ Quality analysis complete with learning - Score: {quality_report['quality_score']:.1f}%, Issues: {len(quality_report['issues'])}")
+            
+        except Exception as e:
+            success = False
+            error_message = str(e)
+            quality_report['error'] = str(e)
+            print(f"❌ Error in quality analysis: {str(e)}")
+            
+            # Log failed analysis for learning
+            execution_time = (datetime.now() - start_time).total_seconds()
+            self.learning_system.log_agent_action(
+                agent_name="DataQualityAgent",
+                action_type="quality_analysis",
+                context=f"dataset_{dataset_name}",
+                input_data={
+                    'dataset_size': [len(df), len(df.columns)]
+                },
+                output_data={
+                    'error': str(e)
+                },
+                success=False,
+                execution_time=execution_time,
+                error_message=str(e)
+            )
         
         return quality_report
 
 class DataHealingAgent(ProductionAIAgent):
     def __init__(self):
         super().__init__("DataHealingAgent", "Data Healing Specialist")
+        self.learning_system = AgentLearningSystem(self.db)
+        print("DataHealingAgent initialized with learning system")
     
     def propose_healing_actions(self, df, quality_report):
-        """Propose specific healing actions for data issues"""
+        """Propose specific healing actions with learning integration"""
+        
+        # Get learning insights for healing decisions
+        learning_insights = self.learning_system.get_agent_recommendations(
+            "DataHealingAgent", 
+            f"healing_{quality_report.get('dataset_name', 'unknown')}"
+        )
+        
         healing_plan = {
             'actions': [],
             'estimated_impact': {},
-            'execution_order': []
+            'execution_order': [],
+            'learning_applied': True,
+            'learned_preferences': learning_insights.get('preferred_methods', {}),
+            'learning_confidence': learning_insights.get('overall_confidence', 0.5)
         }
         
         for issue in quality_report['issues']:
-            if issue['type'] == 'NULL_VALUES' and issue['severity'] in ['HIGH', 'MEDIUM']:
+            if issue['type'] == 'NULL_VALUES' and issue['severity'] in ['HIGH', 'MEDIUM', 'LOW']:
                 action = {
                     'type': 'HANDLE_NULLS',
                     'column': issue['column'],
                     'affected_rows': issue['affected_rows'],
+                    'severity': issue['severity'],
                     'options': []
                 }
                 
@@ -252,21 +365,23 @@ class DataHealingAgent(ProductionAIAgent):
                 
                 healing_plan['actions'].append(action)
             
-            elif issue['type'] == 'DUPLICATES' and issue['severity'] in ['HIGH', 'MEDIUM']:
+            elif issue['type'] == 'DUPLICATES' and issue['severity'] in ['HIGH', 'MEDIUM', 'LOW']:
                 healing_plan['actions'].append({
                     'type': 'REMOVE_DUPLICATES',
                     'affected_rows': issue['affected_rows'],
+                    'severity': issue['severity'],
                     'options': [
                         {'method': 'KEEP_FIRST', 'description': 'Keep first occurrence of duplicates'},
                         {'method': 'KEEP_LAST', 'description': 'Keep last occurrence of duplicates'}
                     ]
                 })
             
-            elif issue['type'] == 'OUTLIERS' and issue['severity'] == 'HIGH':
+            elif issue['type'] == 'OUTLIERS' and issue['severity'] in ['HIGH', 'MEDIUM']:
                 healing_plan['actions'].append({
                     'type': 'HANDLE_OUTLIERS',
                     'column': issue['column'],
                     'affected_rows': issue['affected_rows'],
+                    'severity': issue['severity'],
                     'options': [
                         {'method': 'CAP_OUTLIERS', 'description': 'Cap outliers to 95th percentile'},
                         {'method': 'REMOVE_OUTLIERS', 'description': 'Remove outlier records'},
@@ -471,13 +586,34 @@ class PipelineOrchestratorAgent(ProductionAIAgent):
                     "PENDING_APPROVAL"
                 )
                 
-                # Determine which actions need human approval
-                if action.get('affected_rows', 0) > len(df) * 0.1:  # > 10% of data
+                # Determine which actions need human approval based on severity and impact
+                affected_percentage = (action.get('affected_rows', 0) / len(df) * 100) if len(df) > 0 else 0
+                
+                # Use severity from action if available, otherwise default to LOW
+                action_severity = action.get('severity', 'LOW')
+                
+                # Determine if approval is needed based on severity thresholds
+                needs_approval = False
+                
+                if action_severity == 'HIGH':
+                    # Always require approval for HIGH severity
+                    needs_approval = True
+                elif action_severity == 'MEDIUM':
+                    # Require approval for MEDIUM severity (regardless of percentage)
+                    needs_approval = True
+                elif action_severity == 'LOW' and affected_percentage > 10.0:
+                    # Only require approval for LOW severity if affecting >10%
+                    needs_approval = True
+                
+                if needs_approval:
                     processing_log['human_approvals_needed'].append({
                         'action_id': action_id,
                         'action_type': action['type'],
-                        'impact': f"Affects {action.get('affected_rows', 0)} records",
-                        'recommendation': action['options'][0] if action.get('options') else None
+                        'column': action.get('column', 'N/A'),
+                        'impact': f"Affects {action.get('affected_rows', 0)} records ({affected_percentage:.1f}%)",
+                        'severity': action_severity,
+                        'recommendation': action['options'][0] if action.get('options') else None,
+                        'options': action.get('options', [])
                     })
                 else:
                     # Auto-approve low impact actions
@@ -485,7 +621,7 @@ class PipelineOrchestratorAgent(ProductionAIAgent):
                     self.db.log_agent_action(
                         dataset_id, self.name,
                         f"AUTO_APPROVED_{action['type']}",
-                        f"Auto-approved low-impact action affecting {action.get('affected_rows', 0)} records (<10% threshold)",
+                        f"Auto-approved {action_severity} severity action affecting {action.get('affected_rows', 0)} records ({affected_percentage:.1f}%) - below approval threshold",
                         "COMPLETED"
                     )
         else:

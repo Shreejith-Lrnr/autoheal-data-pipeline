@@ -10,20 +10,20 @@ class Config:
     
     # AI Configuration  
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")  # Make model configurable
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # Updated default model
     GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
     
     # Alternative AI Providers (for future use)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Optional
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # Optional
     
-    # Available Groq Models
+    # Available Groq Models (Updated for current API)
     AVAILABLE_GROQ_MODELS = [
-        "llama3-8b-8192",      # Default - Fast and efficient
-        "llama3-70b-8192",     # Larger, more capable
-        "mixtral-8x7b-32768",  # Different architecture
-        "gemma-7b-it",         # Smaller, faster
-        "llama2-70b-4096"      # Alternative Llama model
+        "llama-3.1-8b-instant",    # Fast and efficient
+        "llama-3.1-70b-versatile", # Larger, more capable
+        "llama-3.1-405b-instruct", # Largest model
+        "llama3-70b-8192",         # Fallback
+        "gemma2-9b-it"             # Alternative
     ]
     
     # Pipeline Configuration
