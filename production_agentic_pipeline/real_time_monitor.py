@@ -62,6 +62,9 @@ class RealTimeDataMonitor:
             try:
                 self.last_activity_check = datetime.now()
                 
+                # Check and auto-fetch API sources
+                api_fetches_count = self._check_and_fetch_apis()
+                
                 # Check for new unprocessed data
                 new_datasets_count = self._check_for_new_data()
                 
@@ -72,14 +75,70 @@ class RealTimeDataMonitor:
                 stalled_count = self._check_stalled_processes()
                 
                 # Log periodic status
-                if new_datasets_count > 0 or quality_alerts_count > 0 or stalled_count > 0:
-                    self._log_activity(f"📊 Monitor check: {new_datasets_count} new datasets, {quality_alerts_count} quality alerts, {stalled_count} stalled processes")
+                if new_datasets_count > 0 or quality_alerts_count > 0 or stalled_count > 0 or api_fetches_count > 0:
+                    self._log_activity(f"📊 Monitor check: {api_fetches_count} API fetches, {new_datasets_count} new datasets, {quality_alerts_count} quality alerts, {stalled_count} stalled processes")
                 
                 time.sleep(self.check_interval)
                 
             except Exception as e:
                 self._log_activity(f"❌ Monitor error: {str(e)}")
                 time.sleep(self.check_interval)
+    
+    def _check_and_fetch_apis(self):
+        """Check active API sources and auto-fetch based on intervals"""
+        fetches_performed = 0
+        try:
+            # Get all active API sources
+            api_sources = self.db.list_api_sources()
+            
+            if api_sources.empty:
+                return 0
+            
+            current_time = datetime.now()
+            
+            for _, source in api_sources.iterrows():
+                if not source['IsActive']:
+                    continue
+                
+                source_id = source['ID']
+                fetch_interval = source['FetchInterval']  # in seconds
+                last_fetch = source['LastFetchTimestamp']
+                
+                # Skip if interval is 0 (manual fetch only)
+                if fetch_interval == 0:
+                    continue
+                
+                # Check if it's time to fetch
+                should_fetch = False
+                if pd.isna(last_fetch):
+                    should_fetch = True  # Never fetched before
+                else:
+                    time_since_last = (current_time - last_fetch).total_seconds()
+                    should_fetch = time_since_last >= fetch_interval
+                
+                if should_fetch:
+                    try:
+                        # Perform auto-fetch
+                        result = self.db.fetch_and_store_api(
+                            source_id=source_id,
+                            url=source['ApiUrl'],
+                            method='GET',
+                            data_format='json',
+                            timeout=15
+                        )
+                        
+                        record_count = len(result) if isinstance(result, pd.DataFrame) else 0
+                        self._log_activity(f"🔄 Auto-fetched API: {source['SourceName']} ({record_count} records)")
+                        fetches_performed += 1
+                        
+                    except Exception as fetch_error:
+                        self._log_activity(f"❌ Auto-fetch failed for {source['SourceName']}: {str(fetch_error)}")
+            
+            return fetches_performed
+            
+        except Exception as e:
+            self._log_activity(f"❌ Error in API auto-fetch: {str(e)}")
+            return 0
     
     def _check_for_new_data(self):
         """Check for new unprocessed datasets"""

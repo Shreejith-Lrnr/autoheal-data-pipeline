@@ -1,0 +1,1665 @@
+"""
+AGENTIC AI ETL PIPELINE SYSTEM
+Complete standalone project with live streaming, dimensional modeling,
+data migration, and validation using goal-oriented AI agents.
+
+MODIFIED: Now supports 3 source types: live API, file upload, database connection.
+"""
+import streamlit as st
+import openai
+import json
+import pandas as pd
+import numpy as np
+import sqlite3
+import sqlalchemy as sa
+from sqlalchemy import create_engine, text, inspect, MetaData, Table, Column, Integer, String, Float, DateTime, ForeignKey
+from datetime import datetime, timedelta
+import threading
+import plotly.express as px
+import queue
+import time
+import os
+import io
+import requests
+from typing import Dict, List, Any, Optional, Tuple, Union
+import logging
+from dataclasses import dataclass, asdict, field
+import uuid
+from contextlib import contextmanager
+import warnings
+from dotenv import load_dotenv
+import traceback
+warnings.filterwarnings('ignore')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+# ==================== CONFIGURATION ====================
+def initialize_openai():
+    """Initialize OpenAI API"""
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY")
+        except:
+            pass
+    if api_key:
+        openai.api_key = api_key
+        return True
+    return False
+# ==================== AGENT MEMORY SYSTEM ====================
+@dataclass
+class AgentMemory:
+    """Persistent memory for agent learning and adaptation"""
+    session_id: str
+    user_intent: str
+    task_history: List[Dict] = field(default_factory=list)
+    error_patterns: List[Dict] = field(default_factory=list)
+    success_patterns: List[Dict] = field(default_factory=list)
+    learned_configurations: Dict = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    def log_task(self, task_name: str, status: str, details: Dict):
+        """Log a task execution"""
+        self.task_history.append({
+            "task": task_name,
+            "status": status,
+            "details": details,
+            "timestamp": datetime.now().isoformat()
+        })
+        self.updated_at = datetime.now()
+    def log_error(self, error_type: str, error_message: str, context: str):
+        """Log an error for learning"""
+        error_entry = {
+            "error_type": error_type,
+            "message": error_message,
+            "context": context,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.error_patterns.append(error_entry)
+        self.updated_at = datetime.now()
+        logger.error(f"Error logged: {error_type} - {error_message}")
+    def log_success(self, task_type: str, config: Dict, result: str):
+        """Log a successful operation for learning"""
+        success_entry = {
+            "task_type": task_type,
+            "configuration": config,
+            "result": result,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.success_patterns.append(success_entry)
+        self.updated_at = datetime.now()
+        logger.info(f"Success logged: {task_type}")
+    def get_error_insights(self) -> Dict:
+        """Analyze error patterns"""
+        if not self.error_patterns:
+            return {"total_errors": 0, "common_errors": []}
+        error_types = {}
+        for error in self.error_patterns:
+            error_type = error['error_type']
+            error_types[error_type] = error_types.get(error_type, 0) + 1
+        return {
+            "total_errors": len(self.error_patterns),
+            "common_errors": sorted(error_types.items(), key=lambda x: x[1], reverse=True)[:5]
+        }
+# ==================== INTENT ANALYSIS AGENT ====================
+class IntentAnalysisAgent:
+    """Goal-oriented agent for understanding natural language queries"""
+    def __init__(self, memory: AgentMemory):
+        self.memory = memory
+        self.intent_cache = {}
+    def analyze_intent(self, user_query: str) -> Dict[str, Any]:
+        """Analyze user query to determine intent and extract entities"""
+        try:
+            # Try OpenAI first
+            if openai.api_key:
+                return self._analyze_with_openai(user_query)
+            else:
+                return self._analyze_with_rules(user_query)
+        except Exception as e:
+            self.memory.log_error("intent_analysis", str(e), user_query)
+            return self._analyze_with_rules(user_query)
+    def _analyze_with_openai(self, user_query: str) -> Dict[str, Any]:
+        """Use OpenAI GPT-4 for intent analysis"""
+        prompt = f"""Analyze this ETL pipeline request and extract intent:
+User Query: "{user_query}"
+Determine:
+1. Primary workflow: "dimensional_modeling_migration_validation", "migration_validation", or "validation_only"
+2. Source type: "live_api", "database", or "file"
+3. Source details: API URL or database connection info
+4. Target database type: "sqlite", "mssql", or "postgresql"
+Return JSON format:
+{{
+    "workflow": "dimensional_modeling_migration_validation",
+    "source_type": "live_api",
+    "source_url": "extracted URL or null",
+    "target_db_type": "sqlite",
+    "interpretation": "Human-readable explanation"
+}}"""
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert ETL pipeline analyzer. Always return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
+            result = json.loads(response.choices[0].message.content)
+            result['method'] = 'openai'
+            self.memory.log_success("intent_analysis", {"query": user_query}, "OpenAI analysis successful")
+            return result
+        except Exception as e:
+            logger.warning(f"OpenAI analysis failed: {e}, falling back to rules")
+            return self._analyze_with_rules(user_query)
+    def _analyze_with_rules(self, user_query: str) -> Dict[str, Any]:
+        """Rule-based intent analysis (fallback)"""
+        query_lower = user_query.lower()
+        # Determine workflow
+        if "dimension" in query_lower or "star schema" in query_lower:
+            workflow = "dimensional_modeling_migration_validation"
+        elif "migrate" in query_lower or "transfer" in query_lower or "move" in query_lower:
+            workflow = "migration_validation"
+        elif "validate" in query_lower or "check" in query_lower:
+            workflow = "validation_only"
+        else:
+            workflow = "migration_validation"
+        # Determine source type
+        if "http" in query_lower or "api" in query_lower or "stream" in query_lower:
+            source_type = "live_api"
+            # Try to extract URL
+            import re
+            url_pattern = r'https?://[^\s]+'
+            urls = re.findall(url_pattern, user_query)
+            source_url = urls[0] if urls else None
+        elif "database" in query_lower or "sql" in query_lower:
+            source_type = "database"
+            source_url = None
+        else:
+            source_type = "file"  # default to file if ambiguous
+            source_url = None
+        # Determine target database
+        if "sql server" in query_lower or "mssql" in query_lower:
+            target_db_type = "mssql"
+        elif "postgres" in query_lower or "postgresql" in query_lower:
+            target_db_type = "postgresql"
+        else:
+            target_db_type = "sqlite"
+        result = {
+            "workflow": workflow,
+            "source_type": source_type,
+            "source_url": source_url,
+            "target_db_type": target_db_type,
+            "interpretation": f"I understand you want to: {workflow.replace('_', ' ')} from {source_type} to {target_db_type}",
+            "method": "rules"
+        }
+        self.memory.log_success("intent_analysis", {"query": user_query}, "Rule-based analysis successful")
+        return result
+# ==================== LIVE STREAMING AGENT ====================
+class LiveStreamingAgent:
+    """Goal: Collect live streaming data from APIs"""
+    def __init__(self, memory: AgentMemory):
+        self.memory = memory
+        self.streaming_active = False
+        self.streaming_thread = None
+        self.data_buffer = queue.Queue(maxsize=10000)
+        self.collected_data = []
+        self.connection_status = "disconnected"
+        self.error_count = 0
+        self.consecutive_errors = 0
+        self.last_data_timestamp = None
+        self.goal = "Collect high-quality live streaming data"
+    def test_connection(self, api_url: str, headers: Dict = None) -> Dict[str, Any]:
+        """Test connection to live API (goal: verify connectivity)"""
+        try:
+            logger.info(f"[LiveStreamingAgent] Testing connection to: {api_url}")
+            response = requests.get(api_url, headers=headers or {}, timeout=10, verify=False)
+            if response.status_code == 200:
+                self.connection_status = "connected"
+                sample_data = None
+                try:
+                    json_data = response.json()
+                    sample_data = json.dumps(json_data, indent=2)[:500]
+                except:
+                    sample_data = response.text[:500]
+                result = {
+                    'status': 'success',
+                    'message': 'âœ… Connection established successfully',
+                    'response_code': response.status_code,
+                    'sample_data': sample_data
+                }
+                self.memory.log_success("streaming_connection_test", {"url": api_url}, "Success")
+                return result
+            else:
+                self.connection_status = "failed"
+                result = {
+                    'status': 'error',
+                    'message': f'âŒ Connection failed with status code {response.status_code}'
+                }
+                self.memory.log_error("streaming_connection_test", f"Status {response.status_code}", api_url)
+                return result
+        except Exception as e:
+            self.connection_status = "error"
+            self.memory.log_error("streaming_connection_test", str(e), api_url)
+            return {
+                'status': 'error',
+                'message': f'âŒ Connection error: {str(e)}'
+            }
+    def start_streaming(self, api_url: str, headers: Dict = None, interval_seconds: int = 5):
+        """Start collecting live data (goal: gather continuous data stream)"""
+        try:
+            if self.streaming_active:
+                return {'status': 'error', 'message': 'Streaming already active'}
+            self.streaming_active = True
+            self.collected_data = []
+            self.error_count = 0
+            self.consecutive_errors = 0
+            self.streaming_thread = threading.Thread(
+                target=self._streaming_worker,
+                args=(api_url, headers, interval_seconds),
+                daemon=True
+            )
+            self.streaming_thread.start()
+            logger.info(f"[LiveStreamingAgent] Started streaming from: {api_url}")
+            self.memory.log_success("streaming_start", {"url": api_url, "interval": interval_seconds}, "Started")
+            return {
+                'status': 'success',
+                'message': f'ðŸ”„ Streaming started (polling every {interval_seconds}s)'
+            }
+        except Exception as e:
+            self.streaming_active = False
+            self.memory.log_error("streaming_start", str(e), api_url)
+            return {'status': 'error', 'message': f'Failed to start: {str(e)}'}
+    def _streaming_worker(self, api_url: str, headers: Dict, interval: int):
+        """Background worker for data collection"""
+        logger.info("[LiveStreamingAgent] Streaming worker started")
+        while self.streaming_active:
+            try:
+                response = requests.get(api_url, headers=headers or {}, timeout=10, verify=False)
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                    except:
+                        data = {"raw_response": response.text}
+                    enriched_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'source_url': api_url,
+                        'record_number': len(self.collected_data) + 1
+                    }
+                    # Flatten nested structures
+                    if isinstance(data, dict):
+                        self._flatten_dict(data, enriched_data)
+                    elif isinstance(data, list) and len(data) > 0:
+                        if isinstance(data[0], dict):
+                            self._flatten_dict(data[0], enriched_data)
+                        else:
+                            enriched_data['data'] = str(data)
+                    else:
+                        enriched_data['data'] = str(data)
+                    if not self.data_buffer.full():
+                        self.data_buffer.put(enriched_data)
+                    self.collected_data.append(enriched_data)
+                    self.last_data_timestamp = datetime.now()
+                    self.consecutive_errors = 0
+                    logger.info(f"[LiveStreamingAgent] Collected data point #{len(self.collected_data)}")
+                else:
+                    self.consecutive_errors += 1
+                    self.error_count += 1
+                    logger.warning(f"[LiveStreamingAgent] API returned {response.status_code}")
+            except Exception as e:
+                self.consecutive_errors += 1
+                self.error_count += 1
+                logger.error(f"[LiveStreamingAgent] Streaming error: {str(e)}")
+                self.memory.log_error("streaming_collection", str(e), "Worker thread")
+                # Adaptive error handling: stop after too many consecutive errors
+                if self.consecutive_errors > 5:
+                    logger.error("[LiveStreamingAgent] Too many errors - stopping stream")
+                    self.streaming_active = False
+                    break
+            time.sleep(interval)
+        logger.info("[LiveStreamingAgent] Streaming worker stopped")
+    def _flatten_dict(self, d: dict, parent: dict, prefix: str = ''):
+        """Recursively flatten nested dictionaries"""
+        for key, value in d.items():
+            new_key = f"{prefix}{key}" if prefix else key
+            if isinstance(value, dict):
+                self._flatten_dict(value, parent, f"{new_key}_")
+            elif isinstance(value, list):
+                parent[new_key] = json.dumps(value)
+            else:
+                parent[new_key] = value
+    def stop_streaming(self) -> Dict[str, Any]:
+        """Stop data collection (goal: finalize data gathering)"""
+        if not self.streaming_active:
+            return {'status': 'warning', 'message': 'Streaming was not active'}
+        self.streaming_active = False
+        if self.streaming_thread:
+            self.streaming_thread.join(timeout=5)
+        logger.info(f"[LiveStreamingAgent] Stopped. Collected {len(self.collected_data)} data points")
+        self.memory.log_success("streaming_stop", {"records": len(self.collected_data)}, "Stopped successfully")
+        return {
+            'status': 'success',
+            'message': f'â¹ï¸ Streaming stopped. Collected {len(self.collected_data)} data points',
+            'data_points_collected': len(self.collected_data)
+        }
+    def get_collected_data(self) -> pd.DataFrame:
+        """Convert collected data to DataFrame (goal: prepare data for processing)"""
+        try:
+            if not self.collected_data:
+                return pd.DataFrame()
+            df = pd.DataFrame(self.collected_data)
+            # Sort by record_number for determinism
+            if 'record_number' in df.columns:
+                df = df.sort_values('record_number').reset_index(drop=True)
+            logger.info(f"[LiveStreamingAgent] Converted {len(df)} records to DataFrame")
+            self.memory.log_success("data_conversion", {"rows": len(df), "cols": len(df.columns)}, "Success")
+            return df
+        except Exception as e:
+            logger.error(f"[LiveStreamingAgent] DataFrame conversion failed: {str(e)}")
+            self.memory.log_error("data_conversion", str(e), "DataFrame creation")
+            return pd.DataFrame()
+    def get_status(self) -> Dict[str, Any]:
+        """Get current streaming status"""
+        return {
+            'is_active': self.streaming_active,
+            'connection_status': self.connection_status,
+            'data_points_collected': len(self.collected_data),
+            'error_count': self.error_count,
+            'last_data_time': self.last_data_timestamp.isoformat() if self.last_data_timestamp else None
+        }
+    @staticmethod
+    def sanitize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+        """Replace invalid characters in column names for SQL compatibility"""
+        df = df.copy()
+        df.columns = (
+            df.columns
+            .str.replace(r'[^a-zA-Z0-9_]', '_', regex=True)
+            .str.replace(r'_+', '_', regex=True)
+            .str.strip('_')
+        )
+        return df
+# ==================== DATABASE AGENT ====================
+class DatabaseAgent:
+    """Goal: Manage database connections and operations reliably"""
+    def __init__(self, memory: AgentMemory):
+        self.memory = memory
+        self.connections = {}
+        self.goal = "Ensure reliable database operations"
+    @contextmanager
+    def get_connection(self, config: Dict, db_type: str):
+        """Get database connection with retry logic"""
+        connection = None
+        engine = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if db_type == "mssql":
+                    connection_string = (
+                        f"mssql+pyodbc://{config['username']}:{config['password']}@"
+                        f"{config['server']}/{config['database']}?"
+                        f"driver=ODBC+Driver+17+for+SQL+Server&"
+                        f"Encrypt=no&TrustServerCertificate=yes"
+                    )
+                elif db_type == "postgresql":
+                    connection_string = (
+                        f"postgresql://{config['username']}:{config['password']}@"
+                        f"{config['host']}:{config.get('port', 5432)}/{config['database']}"
+                    )
+                elif db_type == "sqlite":
+                    connection_string = f"sqlite:///{config['database']}"
+                else:
+                    raise ValueError(f"Unsupported database type: {db_type}")
+                engine = create_engine(connection_string, echo=False)
+                connection = engine.connect()
+                logger.info(f"[DatabaseAgent] Connected to {db_type} database")
+                try:
+                    yield connection
+                except Exception as inner_e:
+                    logger.error(f"[DatabaseAgent] Error during connection use: {str(inner_e)}")
+                    raise
+                finally:
+                    if connection:
+                        connection.close()
+                    if engine:
+                        engine.dispose()
+                return  # Success, exit retry loop
+            except Exception as e:
+                logger.warning(f"[DatabaseAgent] Connection attempt {attempt + 1} failed: {str(e)}")
+                self.memory.log_error("database_connection", str(e), str(config))
+                # Clean up failed connections
+                if connection:
+                    try:
+                        connection.close()
+                    except:
+                        pass
+                if engine:
+                    try:
+                        engine.dispose()
+                    except:
+                        pass
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to connect after {max_retries} attempts: {str(e)}")
+                time.sleep(2 ** attempt)
+    def execute_query(self, config: Dict, db_type: str, query: str) -> pd.DataFrame:
+        """Execute query and return DataFrame"""
+        try:
+            with self.get_connection(config, db_type) as conn:
+                result = pd.read_sql(query, conn)
+                self.memory.log_success("query_execution", {"db_type": db_type, "rows": len(result)}, "Success")
+                return result
+        except Exception as e:
+            logger.error(f"[DatabaseAgent] Query execution failed: {str(e)}")
+            raise
+    def write_dataframe(self, df: pd.DataFrame, config: Dict, db_type: str, table_name: str, if_exists: str = 'replace'):
+        """Write DataFrame to database"""
+        try:
+            with self.get_connection(config, db_type) as conn:
+                df.to_sql(table_name, conn, if_exists=if_exists, index=False)
+                logger.info(f"[DatabaseAgent] Wrote {len(df)} rows to {table_name}")
+                self.memory.log_success("data_write", {"table": table_name, "rows": len(df)}, "Success")
+        except Exception as e:
+            logger.error(f"[DatabaseAgent] Write failed: {str(e)}")
+            raise
+    def get_table_info(self, config: Dict, db_type: str) -> List[Dict]:
+        """Get information about tables in database"""
+        try:
+            with self.get_connection(config, db_type) as conn:
+                inspector = inspect(conn)
+                tables = []
+                for table_name in inspector.get_table_names():
+                    columns = inspector.get_columns(table_name)
+                    tables.append({
+                        'table_name': table_name,
+                        'columns': [col['name'] for col in columns],
+                        'column_count': len(columns)
+                    })
+                return tables
+        except Exception as e:
+            self.memory.log_error("table_info", str(e), str(config))
+            return []
+    def test_connection(self, config: Dict, db_type: str) -> Dict[str, Any]:
+        """Test database connection"""
+        try:
+            with self.get_connection(config, db_type) as conn:
+                # Execute simple query
+                if db_type == "sqlite":
+                    conn.execute(text("SELECT 1"))
+                else:
+                    conn.execute(text("SELECT 1 AS test"))
+                return {
+                    'status': 'success',
+                    'message': f'âœ… Successfully connected to {db_type} database'
+                }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'âŒ Connection failed: {str(e)}'
+            }
+# ==================== DIMENSIONAL MODELING AGENT ====================
+class DimensionalModelingAgent:
+    """Goal: Create optimized star/snowflake schemas"""
+    def __init__(self, memory: AgentMemory, db_agent: DatabaseAgent):
+        self.memory = memory
+        self.db_agent = db_agent
+        self.goal = "Design efficient dimensional models"
+    def analyze_for_dimensions(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze DataFrame to identify dimensions and facts - deterministic"""
+        try:
+            logger.info(f"[DimensionalModelingAgent] Analyzing {len(df)} rows, {len(df.columns)} columns")
+            # Sort columns by name for determinism
+            sorted_columns = sorted(df.columns)
+            df_sorted = df[sorted_columns]
+            dimensions = []
+            facts = []
+            for col in sorted_columns:
+                # Handle NaNs consistently
+                non_null_values = df_sorted[col].dropna()
+                unique_count = non_null_values.nunique()
+                total_non_null = len(non_null_values)
+                unique_ratio = unique_count / total_non_null if total_non_null > 0 else 0
+                # Dimension: low cardinality (< 20% unique values) and categorical
+                if unique_ratio < 0.2 and (df[col].dtype == 'object' or unique_count < 100):
+                    dimensions.append({
+                        'name': col,
+                        'unique_values': unique_count,
+                        'data_type': str(df[col].dtype),
+                        'sample_values': non_null_values.unique()[:5].tolist()
+                    })
+                # Fact: numeric columns with reasonable range
+                elif pd.api.types.is_numeric_dtype(df[col]) and not df[col].isna().all():
+                    facts.append({
+                        'name': col,
+                        'data_type': str(df[col].dtype),
+                        'min': float(df[col].min()),
+                        'max': float(df[col].max()),
+                        'mean': float(df[col].mean())
+                    })
+            # Sort dimensions and facts by name for consistency
+            dimensions.sort(key=lambda x: x['name'])
+            facts.sort(key=lambda x: x['name'])
+            analysis = {
+                'total_rows': len(df),
+                'total_columns': len(df.columns),
+                'dimensions': dimensions,
+                'facts': facts,
+                'recommended_schema': 'star' if len(dimensions) <= 5 else 'snowflake'
+            }
+            logger.info(f"[DimensionalModelingAgent] Found {len(dimensions)} dimensions, {len(facts)} facts")
+            self.memory.log_success("dimensional_analysis", analysis, "Analysis complete")
+            return analysis
+        except Exception as e:
+            self.memory.log_error("dimensional_analysis", str(e), "Analysis failed")
+            raise
+    def explain_schema(self, analysis: Dict) -> str:
+        """Use OpenAI to explain the schema choice"""
+        if not openai.api_key:
+            return f"Schema: {analysis['recommended_schema']}. Chosen because {'few dimensions for star' if analysis['recommended_schema'] == 'star' else 'many dimensions for snowflake'}."
+        dim_names = ', '.join([d['name'] for d in analysis['dimensions'][:3]])
+        if len(analysis['dimensions']) > 3:
+            dim_names += '...'
+        fact_names = ', '.join([f['name'] for f in analysis['facts'][:3]])
+        if len(analysis['facts']) > 3:
+            fact_names += '...'
+        prompt = f"""
+Based on this data analysis:
+- Total rows: {analysis['total_rows']}
+- Total columns: {analysis['total_columns']}
+- Dimensions ({len(analysis['dimensions'])}): {dim_names}
+- Facts ({len(analysis['facts'])}): {fact_names}
+- Recommended schema: {analysis['recommended_schema']}
+Explain what type of schema was chosen, why it was used, and how it benefits the ETL process. Keep explanation concise (2-3 sentences).
+"""
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a data warehousing expert. Explain schema choices clearly."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.5,
+                max_tokens=150
+            )
+            explanation = response.choices[0].message.content.strip()
+            return explanation
+        except Exception as e:
+            logger.warning(f"Schema explanation failed: {e}")
+            return f"Schema: {analysis['recommended_schema']}. Automatic choice based on dimension count."
+    def create_dimensional_model(self, df: pd.DataFrame, target_config: Dict, target_db_type: str, analysis: Dict):
+        """Create dimensional model with robust fact table creation"""
+        try:
+            logger.info("[DimensionalModelingAgent] Creating dimensional model")
+            created_dimensions = []
+            created_facts = []
+            errors = []
+            # CREATE DIMENSIONS
+            for dim in analysis['dimensions']:
+                try:
+                    dim_name = f"dim_{dim['name']}"
+                    dim_df = df[[dim['name']]].drop_duplicates().sort_values(dim['name']).reset_index(drop=True)
+                    dim_df.insert(0, f"{dim['name']}_id", range(1, len(dim_df) + 1))
+                    self.db_agent.write_dataframe(dim_df, target_config, target_db_type, dim_name, 'replace')
+                    logger.info(f"[DimensionalModelingAgent] âœ… Created dimension: {dim_name}")
+                    created_dimensions.append({
+                        'name': dim_name,
+                        'rows': len(dim_df),
+                        'source_column': dim['name']
+                    })
+                except Exception as e:
+                    logger.warning(f"[DimensionalModelingAgent] Failed to create dimension {dim['name']}: {str(e)}")
+                    errors.append(f"Dimension {dim['name']}: {str(e)}")
+                    continue
+            # CREATE FACT TABLE - WITH STRONGER FALLBACKS AND DETERMINISM
+            try:
+                fact_columns = []
+                dimension_source_cols = {dim['name'] for dim in analysis['dimensions']}
+                # Strategy 1: Use timestamp, record_number, or other metadata
+                priority_cols = ['timestamp', 'record_number', 'source_url']
+                for col in sorted(priority_cols):  # Sort for determinism
+                    if col in df.columns:
+                        fact_columns.append(col)
+                # Strategy 2: Add numeric (fact) columns - sorted
+                numeric_cols = sorted([f['name'] for f in analysis['facts']])
+                for col in numeric_cols:
+                    if col in df.columns and col not in fact_columns:
+                        fact_columns.append(col)
+                # Strategy 3: Add non-dimension string columns (e.g., IDs, codes) - sorted
+                other_cols = sorted([col for col in df.columns if col not in fact_columns and col not in dimension_source_cols])
+                fact_columns.extend(other_cols)
+                # Strategy 4: Fallback â€” if still empty, use ALL columns sorted
+                if not fact_columns:
+                    fact_columns = sorted(df.columns.tolist())
+                # Final safety: Ensure at least one column exists
+                if not fact_columns:
+                    raise ValueError("No columns available for fact table")
+                # Final check: ensure all columns exist
+                missing_cols = [col for col in fact_columns if col not in df.columns]
+                if missing_cols:
+                    logger.warning(f"Missing columns in DataFrame: {missing_cols}")
+                    fact_columns = [col for col in fact_columns if col in df.columns]
+                if not fact_columns:
+                    raise ValueError("All fact columns are missing from DataFrame")
+                logger.info(f"[DimensionalModelingAgent] Fact table columns: {fact_columns}")
+                # Create fact DataFrame - sort by priority cols if present
+                sort_cols = ['record_number'] if 'record_number' in fact_columns else None
+                fact_df = df[fact_columns].copy()
+                if sort_cols:
+                    fact_df = fact_df.sort_values(sort_cols).reset_index(drop=True)
+                fact_df.insert(0, 'fact_id', range(1, len(fact_df) + 1))
+                # Write to database
+                self.db_agent.write_dataframe(
+                    fact_df, 
+                    target_config, 
+                    target_db_type, 
+                    'fact_streaming_data', 
+                    'replace'
+                )
+                logger.info(f"[DimensionalModelingAgent] âœ… Created fact table: {len(fact_df)} rows, {len(fact_df.columns)} columns")
+                created_facts.append({
+                    'name': 'fact_streaming_data',
+                    'rows': len(fact_df),
+                    'columns': len(fact_df.columns),
+                    'column_names': fact_columns
+                })
+            except Exception as e:
+                error_msg = f"Fact table creation failed: {str(e)}"
+                logger.error(error_msg)
+                logger.error(traceback.format_exc())
+                errors.append(error_msg)
+                # Still try to proceed if dimensions were created
+                if not created_dimensions:
+                    # If nothing worked, raise
+                    return {
+                        'status': 'error',
+                        'dimensions_created': 0,
+                        'dimension_tables': [],
+                        'fact_tables': [],
+                        'fact_table_rows': 0,
+                        'fact_table_columns': 0,
+                        'errors': [str(e)],
+                        'summary': f"Failed to create fact or dimensions: {str(e)}",
+                        'schema_explanation': ''
+                    }
+            # Generate schema explanation
+            schema_explanation = self.explain_schema(analysis)
+            # Return success result
+            result = {
+                'status': 'success',
+                'dimensions_created': len(created_dimensions),
+                'dimension_tables': created_dimensions,
+                'fact_tables': created_facts,
+                'fact_table_rows': created_facts[0]['rows'] if created_facts else 0,
+                'fact_table_columns': created_facts[0]['columns'] if created_facts else 0,
+                'errors': errors,
+                'summary': f"Created {len(created_dimensions)} dimension(s) and 1 fact table",
+                'schema_explanation': schema_explanation,
+                'analysis': analysis
+            }
+            self.memory.log_success("dimensional_model_creation", result, result['summary'])
+            return result
+        except Exception as e:
+            logger.error(f"[DimensionalModelingAgent] Critical error: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {
+                'status': 'error',
+                'dimensions_created': 0,
+                'dimension_tables': [],
+                'fact_tables': [],
+                'fact_table_rows': 0,
+                'fact_table_columns': 0,
+                'errors': [str(e)],
+                'summary': f"Critical failure: {str(e)}",
+                'schema_explanation': ''
+            }
+# ==================== DATA MIGRATION AGENT ====================
+class DataMigrationAgent:
+    """Goal: Reliably migrate data between systems"""
+    def __init__(self, memory: AgentMemory, db_agent: DatabaseAgent):
+        self.memory = memory
+        self.db_agent = db_agent
+        self.goal = "Ensure complete and accurate data migration"
+    def migrate_data(self, source_df: pd.DataFrame, target_config: Dict, target_db_type: str, table_name: str = 'migrated_data'):
+        """Migrate data from source to target"""
+        try:
+            logger.info(f"[DataMigrationAgent] Starting migration of {len(source_df)} rows to {table_name}")
+            # Data transformation
+            transformed_df = self._transform_data(source_df)
+            # Write to target
+            self.db_agent.write_dataframe(transformed_df, target_config, target_db_type, table_name, 'replace')
+            result = {
+                'status': 'success',
+                'source_rows': len(source_df),
+                'migrated_rows': len(transformed_df),
+                'target_table': table_name
+            }
+            logger.info(f"[DataMigrationAgent] Migration complete: {len(transformed_df)} rows")
+            self.memory.log_success("data_migration", result, "Migration successful")
+            return result
+        except Exception as e:
+            self.memory.log_error("data_migration", str(e), f"Migration to {table_name}")
+            raise
+    def _transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Transform and clean data"""
+        try:
+            transformed = df.copy()
+            # Remove duplicates - sort first for determinism
+            transformed = transformed.sort_index().drop_duplicates()
+            original_count = len(transformed)
+            if len(transformed) < original_count:
+                logger.info(f"[DataMigrationAgent] Removed {original_count - len(transformed)} duplicates")
+            # Handle missing values consistently
+            for col in transformed.columns:
+                if transformed[col].dtype == 'object':
+                    transformed[col] = transformed[col].fillna('Unknown')
+                else:
+                    transformed[col] = transformed[col].fillna(0)
+            logger.info("[DataMigrationAgent] Data transformation complete")
+            return transformed
+        except Exception as e:
+            logger.error(f"[DataMigrationAgent] Transformation error: {str(e)}")
+            return df
+# ==================== DATA VALIDATION AGENT ====================
+class DataValidationAgent:
+    """Goal: Ensure data quality and integrity"""
+    def __init__(self, memory: AgentMemory, db_agent: DatabaseAgent):
+        self.memory = memory
+        self.db_agent = db_agent
+        self.goal = "Validate data quality and completeness"
+    def validate_migration(self, source_df: pd.DataFrame, target_config: Dict, target_db_type: str, table_name: str) -> Dict:
+        """Validate migrated data with comprehensive test cases"""
+        try:
+            logger.info(f"[DataValidationAgent] Validating table: {table_name}")
+            # Read target data
+            try:
+                query = f"SELECT * FROM {table_name}"
+                target_df = self.db_agent.execute_query(target_config, target_db_type, query)
+            except:
+                # Fallback to fact table if migration table not found
+                try:
+                    query = f"SELECT * FROM fact_streaming_data"
+                    target_df = self.db_agent.execute_query(target_config, target_db_type, query)
+                except:
+                    target_df = pd.DataFrame()
+            test_cases = []
+            issues = []
+            quality_metrics = {}
+            # Test Case 1: Row Count Comparison
+            source_rows = len(source_df)
+            target_rows = len(target_df)
+            row_match = target_rows >= source_rows  # Allow expansion from dimensions
+            test_cases.append({
+                'test': 'row_count',
+                'description': 'Compare source and target row counts',
+                'expected': source_rows,
+                'actual': target_rows,
+                'passed': row_match,
+                'details': f'Source: {source_rows}, Target: {target_rows}'
+            })
+            if not row_match:
+                issues.append('Row count mismatch: fewer rows in target')
+            # Test Case 2: Column Count
+            source_cols = len(source_df.columns)
+            target_cols = len(target_df.columns)
+            col_match = target_cols > 0
+            test_cases.append({
+                'test': 'column_count',
+                'description': 'Check if target has columns',
+                'expected': source_cols,
+                'actual': target_cols,
+                'passed': col_match,
+                'details': f'Source: {source_cols}, Target: {target_cols}'
+            })
+            if not col_match:
+                issues.append('No columns in target')
+            # Test Case 3: Null Values Percentage
+            if len(target_df) > 0:
+                null_counts = target_df.isnull().sum()
+                total_cells = len(target_df) * len(target_df.columns)
+                null_percentage = (null_counts.sum() / total_cells) * 100 if total_cells > 0 else 0
+                null_passed = null_percentage < 5  # Less than 5% nulls
+                quality_metrics['null_percentage'] = round(null_percentage, 2)
+            else:
+                null_passed = False
+                null_percentage = 100
+                quality_metrics['null_percentage'] = 100
+            test_cases.append({
+                'test': 'null_check',
+                'description': 'Check for missing values in target',
+                'expected': '< 5%',
+                'actual': f'{null_percentage:.2f}%',
+                'passed': null_passed,
+                'details': f'{null_counts.sum()} null cells out of {total_cells}'
+            })
+            if not null_passed:
+                issues.append(f'High null percentage: {null_percentage:.2f}%')
+            # Test Case 4: Duplicates in Target
+            target_dups = target_df.duplicated().sum()
+            dup_passed = target_dups == 0
+            test_cases.append({
+                'test': 'duplicates',
+                'description': 'Check for duplicate rows in target',
+                'expected': 0,
+                'actual': target_dups,
+                'passed': dup_passed,
+                'details': f'{target_dups} duplicate rows'
+            })
+            if not dup_passed:
+                issues.append(f'Duplicates found: {target_dups}')
+            # Test Case 5: Data Types Consistency (basic)
+            common_cols = set(source_df.columns) & set(target_df.columns)
+            type_mismatches = 0
+            for col in common_cols:
+                source_type = str(source_df[col].dtype)
+                target_type = str(target_df[col].dtype)
+                if source_type != target_type:
+                    type_mismatches += 1
+            type_passed = type_mismatches == 0
+            test_cases.append({
+                'test': 'data_types',
+                'description': 'Compare data types for common columns',
+                'expected': 'All match',
+                'actual': f'{type_mismatches} mismatches',
+                'passed': type_passed,
+                'details': f'Common columns: {len(common_cols)}, Mismatches: {type_mismatches}'
+            })
+            if not type_passed:
+                issues.append(f'Data type mismatches: {type_mismatches}')
+            # Test Case 6: Numeric Columns Summary Statistics (if applicable)
+            numeric_mismatches = 0
+            if len(common_cols) > 0:
+                common_numeric = [col for col in common_cols if pd.api.types.is_numeric_dtype(source_df[col]) and pd.api.types.is_numeric_dtype(target_df[col])]
+                for col in common_numeric:
+                    source_sum = source_df[col].sum()
+                    target_sum = target_df[col].sum()
+                    if abs(source_sum - target_sum) > 0.01:  # Allow small float diff
+                        numeric_mismatches += 1
+                num_passed = numeric_mismatches == 0
+                test_cases.append({
+                    'test': 'numeric_summary',
+                    'description': 'Compare sums for numeric columns',
+                    'expected': 'Sums match',
+                    'actual': f'{numeric_mismatches} mismatches',
+                    'passed': num_passed,
+                    'details': f'Numeric columns: {len(common_numeric)}, Sum mismatches: {numeric_mismatches}'
+                })
+                if not num_passed:
+                    issues.append(f'Numeric sum mismatches: {numeric_mismatches}')
+            else:
+                num_passed = True
+            # Overall Quality Score
+            passed_tests = sum(1 for t in test_cases if t['passed'])
+            total_tests = len(test_cases)
+            quality_score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+            validation_result = {
+                'source_row_count': source_rows,
+                'target_row_count': target_rows,
+                'row_count_match': row_match,
+                'source_columns': source_cols,
+                'target_columns': target_cols,
+                'data_quality_score': round(quality_score, 2),
+                'test_cases': test_cases,
+                'issues': issues,
+                'quality_metrics': quality_metrics,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'EXCELLENT' if quality_score >= 95 else 'GOOD' if quality_score >= 80 else 'ACCEPTABLE' if quality_score >= 60 else 'POOR'
+            }
+            logger.info(f"[DataValidationAgent] Validation complete. Quality score: {quality_score:.2f}")
+            self.memory.log_success("data_validation", validation_result, f"Score: {quality_score:.2f}")
+            return validation_result
+        except Exception as e:
+            logger.error(f"[DataValidationAgent] Validation failed: {str(e)}")
+            self.memory.log_error("data_validation", str(e), table_name)
+            # Return partial result
+            return {
+                'source_row_count': len(source_df),
+                'target_row_count': 0,
+                'row_count_match': False,
+                'source_columns': len(source_df.columns),
+                'target_columns': 0,
+                'data_quality_score': 0.0,
+                'test_cases': [],
+                'issues': [f"Validation error: {str(e)}"],
+                'quality_metrics': {},
+                'status': 'ERROR',
+                'timestamp': datetime.now().isoformat()
+            }
+# ==================== ORCHESTRATOR AGENT ====================
+class OrchestratorAgent:
+    """Goal: Coordinate all agents to achieve user's intent"""
+    def __init__(self, memory: AgentMemory):
+        self.memory = memory
+        self.goal = "Successfully execute user's ETL workflow"
+        # Initialize all sub-agents
+        self.intent_agent = IntentAnalysisAgent(memory)
+        self.streaming_agent = LiveStreamingAgent(memory)
+        self.db_agent = DatabaseAgent(memory)
+        self.dimensional_agent = DimensionalModelingAgent(memory, self.db_agent)
+        self.migration_agent = DataMigrationAgent(memory, self.db_agent)
+        self.validation_agent = DataValidationAgent(memory, self.db_agent)
+    def execute_workflow(self, workflow: str, source_df: pd.DataFrame, target_config: Dict, target_db_type: str) -> Dict:
+        """Execute workflow with proper error handling per step"""
+        try:
+            logger.info(f"[OrchestratorAgent] Executing workflow: {workflow}")
+            results = {'workflow': workflow, 'steps': [], 'status': 'success'}
+            if workflow == "dimensional_modeling_migration_validation":
+                # Step 1: Dimensional Modeling
+                try:
+                    logger.info("[OrchestratorAgent] Step 1/3: Dimensional Modeling")
+                    analysis = self.dimensional_agent.analyze_for_dimensions(source_df)
+                    model_result = self.dimensional_agent.create_dimensional_model(
+                        source_df, target_config, target_db_type, analysis
+                    )
+                    results['steps'].append({'step': 'dimensional_modeling', 'result': model_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Dimensional modeling failed: {str(e)}")
+                    results['steps'].append({'step': 'dimensional_modeling', 'status': 'failed', 'error': str(e)})
+                # Step 2: Data Migration
+                try:
+                    logger.info("[OrchestratorAgent] Step 2/3: Data Migration")
+                    migration_result = self.migration_agent.migrate_data(
+                        source_df, target_config, target_db_type, 'migrated_streaming_data'
+                    )
+                    results['steps'].append({'step': 'data_migration', 'result': migration_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Data migration failed: {str(e)}")
+                    results['steps'].append({'step': 'data_migration', 'status': 'failed', 'error': str(e)})
+                # Step 3: Data Validation
+                try:
+                    logger.info("[OrchestratorAgent] Step 3/3: Data Validation")
+                    validation_result = self.validation_agent.validate_migration(
+                        source_df, target_config, target_db_type, 'migrated_streaming_data'
+                    )
+                    results['steps'].append({'step': 'data_validation', 'result': validation_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Data validation failed: {str(e)}")
+                    results['steps'].append({'step': 'data_validation', 'status': 'failed', 'error': str(e)})
+            elif workflow == "migration_validation":
+                # Step 1: Data Migration
+                try:
+                    logger.info("[OrchestratorAgent] Step 1/2: Data Migration")
+                    migration_result = self.migration_agent.migrate_data(
+                        source_df, target_config, target_db_type, 'migrated_streaming_data'
+                    )
+                    results['steps'].append({'step': 'data_migration', 'result': migration_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Data migration failed: {str(e)}")
+                    results['steps'].append({'step': 'data_migration', 'status': 'failed', 'error': str(e)})
+                # Step 2: Data Validation
+                try:
+                    logger.info("[OrchestratorAgent] Step 2/2: Data Validation")
+                    validation_result = self.validation_agent.validate_migration(
+                        source_df, target_config, target_db_type, 'migrated_streaming_data'
+                    )
+                    results['steps'].append({'step': 'data_validation', 'result': validation_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Data validation failed: {str(e)}")
+                    results['steps'].append({'step': 'data_validation', 'status': 'failed', 'error': str(e)})
+            elif workflow == "validation_only":
+                # Step 1: Data Validation (on source or assume target exists)
+                try:
+                    logger.info("[OrchestratorAgent] Step 1/1: Data Validation")
+                    # For validation only, validate source data quality
+                    validation_result = self._validate_source_only(source_df)
+                    results['steps'].append({'step': 'data_validation', 'result': validation_result, 'status': 'success'})
+                except Exception as e:
+                    logger.error(f"Data validation failed: {str(e)}")
+                    results['steps'].append({'step': 'data_validation', 'status': 'failed', 'error': str(e)})
+            # Determine final status
+            success_count = len([s for s in results['steps'] if s.get('status') == 'success'])
+            failed_count = len([s for s in results['steps'] if s.get('status') == 'failed'])
+            if failed_count > 0 and success_count == 0:
+                results['status'] = 'error'
+            elif failed_count > 0:
+                results['status'] = 'partial_success'
+            else:
+                results['status'] = 'success'
+            return results
+        except Exception as e:
+            logger.error(f"[OrchestratorAgent] Unexpected error: {str(e)}")
+            return {'workflow': workflow, 'status': 'error', 'error': str(e), 'steps': []}
+    def _validate_source_only(self, source_df: pd.DataFrame) -> Dict:
+        """Validate source data only"""
+        test_cases = []
+        issues = []
+        # Basic source validation
+        source_rows = len(source_df)
+        source_cols = len(source_df.columns)
+        # Nulls
+        null_percentage = (source_df.isnull().sum().sum() / (source_rows * source_cols)) * 100 if source_rows > 0 else 0
+        null_passed = null_percentage < 5
+        test_cases.append({
+            'test': 'source_nulls',
+            'description': 'Check nulls in source',
+            'expected': '< 5%',
+            'actual': f'{null_percentage:.2f}%',
+            'passed': null_passed
+        })
+        # Duplicates
+        dups = source_df.duplicated().sum()
+        dup_passed = dups == 0
+        test_cases.append({
+            'test': 'source_duplicates',
+            'description': 'Check duplicates in source',
+            'expected': 0,
+            'actual': dups,
+            'passed': dup_passed
+        })
+        passed = sum(1 for t in test_cases if t['passed'])
+        score = (passed / len(test_cases)) * 100
+        return {
+            'source_row_count': source_rows,
+            'data_quality_score': round(score, 2),
+            'test_cases': test_cases,
+            'issues': issues if dup_passed and null_passed else ['Source data quality issues'],
+            'status': 'GOOD' if score >= 80 else 'POOR'
+        }
+# ==================== MAIN APP ====================
+def main():
+    st.set_page_config(
+        page_title="Agentic AI ETL Pipeline",
+        page_icon="ðŸ¤–",
+        layout="wide"
+    )
+    # Initialize OpenAI
+    openai_available = initialize_openai()
+    # Initialize session state
+    if 'memory' not in st.session_state:
+        st.session_state.memory = AgentMemory(
+            session_id=str(uuid.uuid4()),
+            user_intent=""
+        )
+    if 'orchestrator' not in st.session_state:
+        st.session_state.orchestrator = OrchestratorAgent(st.session_state.memory)
+    if 'page' not in st.session_state:
+        st.session_state.page = 'query'
+    if 'intent_result' not in st.session_state:
+        st.session_state.intent_result = None
+    if 'streaming_data' not in st.session_state:
+        st.session_state.streaming_data = None
+    if 'workflow_results' not in st.session_state:
+        st.session_state.workflow_results = None
+    # Header
+    st.title("ðŸ¤– Agentic AI ETL Pipeline System")
+    st.caption("Goal-oriented AI agents for live streaming, dimensional modeling, data migration, and validation")
+    # Sidebar
+    with st.sidebar:
+        st.header("ðŸŽ¯ Session Info")
+        st.text(f"Session ID: {st.session_state.memory.session_id[:8]}...")
+        st.text(f"Started: {st.session_state.memory.created_at.strftime('%H:%M:%S')}")
+        if not openai_available:
+            st.warning("âš ï¸ OpenAI not configured. Using rule-based analysis.")
+        else:
+            st.success("âœ… OpenAI API active")
+        st.divider()
+        # Memory insights
+        error_insights = st.session_state.memory.get_error_insights()
+        st.metric("Total Errors", error_insights['total_errors'])
+        st.metric("Successful Operations", len(st.session_state.memory.success_patterns))
+        if st.button("ðŸ”„ Reset Session"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+    # PAGE 1: Natural Language Query
+    if st.session_state.page == 'query':
+        st.header("ðŸ“ Step 1: Describe Your ETL Task")
+        user_query = st.text_area(
+            "Enter your request in natural language:",
+            placeholder="Example: Stream live weather data from an API, create a dimensional model, migrate to SQLite, and validate the results",
+            height=100
+        )
+        if st.button("ðŸ” Analyze My Request", type="primary"):
+            if not user_query:
+                st.error("Please enter a request first")
+            else:
+                with st.spinner("ðŸ¤– AI agents analyzing your request..."):
+                    intent_result = st.session_state.orchestrator.intent_agent.analyze_intent(user_query)
+                    st.session_state.intent_result = intent_result
+                    st.session_state.user_query = user_query
+                    st.session_state.page = 'confirm'
+                    st.rerun()
+    # PAGE 2: Confirm Intent
+    elif st.session_state.page == 'confirm':
+        st.header("âœ… Step 2: Confirm Understanding")
+        intent = st.session_state.intent_result
+        st.info(f"**AI Interpretation ({intent['method']} analysis):**\n{intent['interpretation']}")
+        # Show chosen path
+        workflow = intent['workflow']
+        if workflow == "dimensional_modeling_migration_validation":
+            path_desc = "Path 1: Dimensional Modeling â†’ Data Migration â†’ Data Validation"
+        elif workflow == "migration_validation":
+            path_desc = "Path 2: Data Migration â†’ Data Validation"
+        else:
+            path_desc = "Path 3: Data Validation Only"
+        st.success(f"**Chosen Path:** {path_desc}")
+        if intent.get('source_url'):
+            st.success(f"ðŸ“¡ Detected API URL: {intent['source_url']}")
+        st.divider()
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("âœ… Yes, Proceed", type="primary"):
+                st.session_state.page = 'source'
+                st.rerun()
+        with col_b:
+            if st.button("âŒ No, Re-enter Query"):
+                st.session_state.page = 'query'
+                st.session_state.intent_result = None
+                st.rerun()
+    # PAGE 3: SOURCE CONFIGURATION (MODIFIED FROM 'streaming' TO 'source')
+    elif st.session_state.page == 'source':
+        st.header("ðŸ“¥ Step 3: Configure Data Source")
+
+        intent = st.session_state.intent_result
+        source_type_from_intent = intent.get('source_type', 'live_api')
+
+        # Allow user to override source type via UI
+        source_options = {
+            "Live API Streaming": "live_api",
+            "Upload File (CSV/Excel)": "file",
+            "Database Connection": "database"
+        }
+        selected_label = st.selectbox(
+            "Select Source Type",
+            options=list(source_options.keys()),
+            index=list(source_options.values()).index(source_type_from_intent) if source_type_from_intent in source_options.values() else 0
+        )
+        source_type = source_options[selected_label]
+
+        st.divider()
+
+        if source_type == "live_api":
+            st.subheader("ðŸ“¡ Live API Streaming")
+            # Pre-fill URL if detected
+            default_url = intent.get('source_url', '')
+            if not default_url:
+                default_url = "https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
+            streaming_url = st.text_input("API URL", value=default_url)
+            streaming_interval = st.slider("Polling Interval (seconds)", 1, 60, 5)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info("**Instructions:**\n1. Test connection\n2. Start collecting\n3. Wait 10-20 seconds\n4. Stop collection\n5. Continue")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                if st.button("ðŸ”Œ Test Connection", key="test_conn_btn"):
+                    with st.spinner("Testing..."):
+                        result = st.session_state.orchestrator.streaming_agent.test_connection(streaming_url)
+                        if result['status'] == 'success':
+                            st.success(result['message'])
+                            if result.get('sample_data'):
+                                with st.expander("Sample Response"):
+                                    st.code(result['sample_data'])
+                            st.session_state.connection_ok = True
+                        else:
+                            st.error(result['message'])
+                            st.session_state.connection_ok = False
+            with col_b:
+                start_disabled = not st.session_state.get('connection_ok', False) or st.session_state.get('streaming_active', False)
+                if st.button("â–¶ï¸ Start Collecting", key="start_stream_btn", disabled=start_disabled):
+                    result = st.session_state.orchestrator.streaming_agent.start_streaming(
+                        streaming_url, None, streaming_interval
+                    )
+                    if result['status'] == 'success':
+                        st.success(result['message'])
+                        st.session_state.streaming_active = True
+                        st.session_state.auto_refresh = True
+                        st.rerun()
+            with col_c:
+                if st.button("â¹ï¸ Stop Collection", key="stop_stream_btn",
+                            disabled=not st.session_state.get('streaming_active', False)):
+                    result = st.session_state.orchestrator.streaming_agent.stop_streaming()
+                    collected_df = st.session_state.orchestrator.streaming_agent.get_collected_data()
+                    st.session_state.streaming_data = collected_df
+                    st.session_state.streaming_active = False
+                    st.session_state.auto_refresh = False
+                    st.success(f"â¹ï¸ Stopped! Collected {len(collected_df)} records")
+                    st.rerun()
+
+            if st.session_state.get('streaming_active', False):
+                status = st.session_state.orchestrator.streaming_agent.get_status()
+                col1, col2, col3 = st.columns(3)
+                col1.metric("ðŸ“Š Records Collected", status['data_points_collected'])
+                col2.metric("âŒ Error Count", status['error_count'])
+                col3.metric("ðŸ”„ Status", "ðŸŸ¢ ACTIVE" if status['is_active'] else "ðŸ”´ STOPPED")
+                if st.session_state.orchestrator.streaming_agent.collected_data:
+                    with st.expander("ðŸ“‹ Latest 5 Records", expanded=True):
+                        latest = pd.DataFrame(st.session_state.orchestrator.streaming_agent.collected_data[-5:])
+                        st.dataframe(latest, use_container_width=True, height=200)
+                if st.session_state.get('auto_refresh', False):
+                    time.sleep(2)
+                    st.rerun()
+
+            if not st.session_state.get('streaming_active', False):
+                if st.session_state.streaming_data is not None and not st.session_state.streaming_data.empty:
+                    st.success(f"âœ… **Data Collection Complete!**")
+                    col_info1, col_info2, col_info3 = st.columns(3)
+                    col_info1.metric("Total Records", len(st.session_state.streaming_data))
+                    col_info2.metric("Total Columns", len(st.session_state.streaming_data.columns))
+                    col_info3.metric("Data Size", f"{st.session_state.streaming_data.memory_usage(deep=True).sum() / 1024:.1f} KB")
+                    with st.expander("ðŸ“Š Preview Collected Data"):
+                        st.dataframe(st.session_state.streaming_data.head(20), use_container_width=True)
+                    col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+                    with col_nav2:
+                        if st.button("âž¡ï¸ Continue to Target Configuration", type="primary", key="continue_btn", use_container_width=True):
+                            st.session_state.page = 'target_config'
+                            st.rerun()
+                else:
+                    st.info("ðŸ‘† Start collecting data to proceed")
+
+        elif source_type == "file":
+            st.subheader("ðŸ’¾ Upload File (CSV or Excel)")
+            uploaded_file = st.file_uploader("Choose a file", type=["csv", "xlsx", "xls"])
+            if uploaded_file is not None:
+                try:
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    st.success(f"âœ… Loaded {len(df)} rows and {len(df.columns)} columns")
+                    st.session_state.streaming_data = df
+                    with st.expander("ðŸ“Š Preview Data"):
+                        st.dataframe(df.head(20), use_container_width=True)
+                    if st.button("âž¡ï¸ Continue to Target Configuration", type="primary", use_container_width=True):
+                        st.session_state.page = 'target_config'
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"âŒ Failed to load file: {str(e)}")
+            else:
+                st.info("ðŸ‘† Please upload a CSV or Excel file to continue.")
+
+        elif source_type == "database":
+            st.subheader("ðŸ—ƒï¸ Database Connection")
+            default_db = "sqlite"
+            col1, col2 = st.columns(2)
+            with col1:
+                source_db_type = st.selectbox(
+                    "Source Database Type",
+                    ["sqlite", "mssql", "postgresql"],
+                    index=0
+                )
+            # Configuration
+            if source_db_type == "sqlite":
+                st.info("ðŸ’¡ SQLite is file-based.")
+                source_database = st.text_input("Database File Path", value="example.db")
+                source_config = {'database': source_database}
+            elif source_db_type == "mssql":
+                st.warning("âš ï¸ Ensure SQL Server is running")
+                server = st.text_input("Server", value="localhost")
+                username = st.text_input("Username", value="sa")
+                password = st.text_input("Password", type="password")
+                database = st.text_input("Database", value="ETL_DB")
+                source_config = {'server': server, 'database': database, 'username': username, 'password': password}
+            elif source_db_type == "postgresql":
+                st.warning("âš ï¸ Ensure PostgreSQL is running")
+                host = st.text_input("Host", value="localhost")
+                port = st.number_input("Port", value=5432, min_value=1, max_value=65535)
+                username = st.text_input("Username", value="postgres")
+                password = st.text_input("Password", type="password")
+                database = st.text_input("Database", value="etl_db")
+                source_config = {'host': host, 'port': int(port), 'database': database, 'username': username, 'password': password}
+            query = st.text_area("SQL Query", value="SELECT * FROM your_table LIMIT 1000", height=100)
+            if st.button("ðŸ” Fetch Data", type="primary"):
+                try:
+                    with st.spinner("Fetching data..."):
+                        df = st.session_state.orchestrator.db_agent.execute_query(source_config, source_db_type, query)
+                        st.success(f"âœ… Fetched {len(df)} rows")
+                        st.session_state.streaming_data = df
+                        with st.expander("ðŸ“Š Preview Data"):
+                            st.dataframe(df.head(20), use_container_width=True)
+                        if st.button("âž¡ï¸ Continue to Target Configuration", key="continue_db_btn", type="primary", use_container_width=True):
+                            st.session_state.page = 'target_config'
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"âŒ Query failed: {str(e)}")
+            if 'streaming_data' in st.session_state and st.session_state.streaming_data is not None:
+                if st.button("âž¡ï¸ Continue to Target Configuration", type="primary", use_container_width=True, key="continue_db_after_fetch"):
+                    st.session_state.page = 'target_config'
+                    st.rerun()
+
+    # PAGE 4: Target Configuration (unchanged)
+    elif st.session_state.page == 'target_config':
+        st.header("ðŸŽ¯ Step 4: Configure Target Database")
+        # Verify source data
+        if st.session_state.streaming_data is None or st.session_state.streaming_data.empty:
+            st.error("âŒ No source data found! Please go back and provide data first.")
+            if st.button("â† Back to Source"):
+                st.session_state.page = 'source'
+                st.rerun()
+            st.stop()
+        # Show data preview
+        st.success(f"âœ… {len(st.session_state.streaming_data)} records ready for processing")
+        with st.expander("ðŸ“Š Preview Source Data"):
+            st.dataframe(st.session_state.streaming_data.head(10), use_container_width=True)
+            col1, col2 = st.columns(2)
+            col1.metric("Rows", len(st.session_state.streaming_data))
+            col2.metric("Columns", len(st.session_state.streaming_data.columns))
+        st.divider()
+        # Database type selection
+        st.subheader("Select Target Database")
+        default_db = "sqlite"
+        if st.session_state.intent_result:
+            default_db = st.session_state.intent_result.get('target_db_type', 'sqlite')
+        try:
+            default_index = ["sqlite", "mssql", "postgresql"].index(default_db)
+        except:
+            default_index = 0
+        target_db_type = st.selectbox(
+            "Target Database Type", 
+            ["sqlite", "mssql", "postgresql"],
+            index=default_index,
+            help="For demo, SQLite is recommended (no setup required)"
+        )
+        # Configuration
+        if target_db_type == "sqlite":
+            st.info("ðŸ’¡ SQLite is file-based and requires no authentication - perfect for demos!")
+            target_database = st.text_input("Database File", value="etl_output.db")
+            target_config = {'database': target_database}
+        elif target_db_type == "mssql":
+            st.warning("âš ï¸ Ensure SQL Server is running and you have valid credentials")
+            col1, col2 = st.columns(2)
+            with col1:
+                target_server = st.text_input("Server", value="localhost")
+                target_username = st.text_input("Username", value="sa")
+            with col2:
+                target_database = st.text_input("Database", value="ETL_DB")
+                target_password = st.text_input("Password", type="password", value="")
+            target_config = {
+                'server': target_server,
+                'database': target_database,
+                'username': target_username,
+                'password': target_password
+            }
+        elif target_db_type == "postgresql":
+            st.warning("âš ï¸ Ensure PostgreSQL is running and you have valid credentials")
+            col1, col2 = st.columns(2)
+            with col1:
+                target_host = st.text_input("Host", value="localhost")
+                target_port = st.number_input("Port", value=5432, min_value=1, max_value=65535)
+                target_username = st.text_input("Username", value="postgres")
+            with col2:
+                target_database = st.text_input("Database", value="etl_db")
+                target_password = st.text_input("Password", type="password", value="")
+            target_config = {
+                'host': target_host,
+                'port': int(target_port),
+                'database': target_database,
+                'username': target_username,
+                'password': target_password
+            }
+        # Save to session state
+        st.session_state.target_config = target_config
+        st.session_state.target_db_type = target_db_type
+        st.divider()
+        # Test and Execute buttons
+        col_test, col_execute = st.columns(2)
+        with col_test:
+            if st.button("ðŸ”Œ Test Target Connection", key="test_target_btn", use_container_width=True):
+                with st.spinner("Testing connection..."):
+                    try:
+                        test_result = st.session_state.orchestrator.db_agent.test_connection(
+                            target_config, target_db_type
+                        )
+                        if test_result['status'] == 'success':
+                            st.success(test_result['message'])
+                            st.session_state.target_connection_ok = True
+                        else:
+                            st.error(test_result['message'])
+                            st.session_state.target_connection_ok = False
+                            if target_db_type == "mssql":
+                                st.info("ðŸ’¡ **Tips for SQL Server:**\n- Ensure SQL Server is running\n- Enable SQL Server authentication\n- Check username/password\n- Try using SQLite instead for demo")
+                            elif target_db_type == "postgresql":
+                                st.info("ðŸ’¡ **Tips for PostgreSQL:**\n- Ensure PostgreSQL is running\n- Check pg_hba.conf for authentication\n- Verify username/password\n- Try using SQLite instead for demo")
+                    except Exception as e:
+                        st.error(f"Connection test failed: {str(e)}")
+                        st.session_state.target_connection_ok = False
+        with col_execute:
+            execute_disabled = not st.session_state.get('target_connection_ok', target_db_type == 'sqlite')
+            if st.button("â–¶ï¸ Execute Pipeline", key="execute_pipeline_btn", 
+                        type="primary", 
+                        disabled=execute_disabled,
+                        use_container_width=True):
+                st.session_state.page = 'execute'
+                st.rerun()
+        if target_db_type == "sqlite":
+            st.success("âœ… SQLite requires no connection test - ready to execute!")
+            st.session_state.target_connection_ok = True
+        elif st.session_state.get('target_connection_ok', False):
+            st.success("âœ… Target connection verified - ready to execute!")
+        else:
+            st.warning("âš ï¸ Please test the target connection before executing the pipeline")
+
+    # PAGE 5 & 6: Execute and Results (unchanged)
+    elif st.session_state.page == 'execute':
+        st.header("âš™ï¸ Step 5: Pipeline Execution")
+        if st.session_state.streaming_data is None or st.session_state.streaming_data.empty:
+            st.error("âŒ No source data found!")
+            if st.button("â† Back to Source"):
+                st.session_state.page = 'source'
+                st.rerun()
+            st.stop()
+        if not st.session_state.target_config:
+            st.error("âŒ No target configuration found!")
+            if st.button("â† Back to Configuration"):
+                st.session_state.page = 'target_config'
+                st.rerun()
+            st.stop()
+        workflow = "migration_validation"
+        if st.session_state.intent_result:
+            workflow = st.session_state.intent_result.get('workflow', 'migration_validation')
+        st.info(f"**Executing Workflow:** {workflow.replace('_', ' ').title()}")
+        col1, col2 = st.columns(2)
+        col1.metric("Source Records", len(st.session_state.streaming_data))
+        col2.metric("Target Database", st.session_state.target_db_type.upper())
+        st.divider()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        try:
+            status_text.text("ðŸ¤– Initializing agents...")
+            progress_bar.progress(10)
+            time.sleep(0.5)
+            status_text.text("ðŸ“Š Analyzing workflow requirements...")
+            progress_bar.progress(20)
+            time.sleep(0.5)
+            status_text.text("âš™ï¸ Executing pipeline...")
+            progress_bar.progress(30)
+            with st.spinner("ðŸ¤– Agents working on your data..."):
+                results = st.session_state.orchestrator.execute_workflow(
+                    workflow,
+                    st.session_state.streaming_data,
+                    st.session_state.target_config,
+                    st.session_state.target_db_type
+                )
+            progress_bar.progress(100)
+            status_text.text("âœ… Pipeline execution complete!")
+            st.session_state.workflow_results = results
+            time.sleep(2)
+            st.session_state.page = 'results'
+            st.rerun()
+        except Exception as e:
+            progress_bar.progress(0)
+            status_text.text("")
+            st.error(f"âŒ Pipeline execution failed!")
+            with st.expander("âŒ Error Details", expanded=True):
+                st.code(str(e))
+                st.code(traceback.format_exc())
+            col_retry, col_back = st.columns(2)
+            with col_retry:
+                if st.button("ðŸ”„ Try Again", use_container_width=True):
+                    st.rerun()
+            with col_back:
+                if st.button("â† Back to Configuration", use_container_width=True):
+                    st.session_state.page = 'target_config'
+                    st.rerun()
+
+    elif st.session_state.page == 'results':
+        st.header("ðŸ“Š Step 6: Results & Validation")
+        if not st.session_state.workflow_results:
+            st.error("âŒ No results found!")
+            if st.button("â† Start Over"):
+                st.session_state.page = 'query'
+                st.rerun()
+            st.stop()
+        results = st.session_state.workflow_results
+        if results.get('status') == 'success':
+            st.success("âœ… **Pipeline Executed Successfully!**")
+            st.subheader("ðŸ“ˆ Execution Summary")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Workflow", results.get('workflow', 'N/A').replace('_', ' ').title())
+            col2.metric("Steps Completed", len(results.get('steps', [])))
+            col3.metric("Status", "SUCCESS")
+            st.divider()
+            st.subheader("ðŸ” Step-by-Step Results")
+            for i, step in enumerate(results.get('steps', []), 1):
+                step_name = step.get('step', 'Unknown').replace('_', ' ').title()
+                step_result = step.get('result', {})
+                with st.expander(f"**Step {i}: {step_name}**", expanded=(i == len(results.get('steps', [])))):
+                    if step['step'] == 'dimensional_modeling':
+                        schema_type = step_result.get('analysis', {}).get('recommended_schema', 'unknown')
+                        explanation = step_result.get('schema_explanation', 'No explanation available')
+                        st.info(f"**Schema Type:** {schema_type.upper()}")
+                        st.write(f"**Why this schema:** {explanation}")
+
+                        # ðŸ”’ Define variables safely at the top
+                        dim_tables = step_result.get('dimension_tables', [])
+                        fact_tables = step_result.get('fact_tables', [])
+                        fact_rows = step_result.get('fact_table_rows', 0)
+
+                        # âœ… Now use them
+                        col_a, col_b, col_c = st.columns(3)
+                        col_a.metric("Dimension Tables Created", len(dim_tables))
+                        col_b.metric("Fact Tables Created", len(fact_tables))
+                        col_c.metric("Fact Table Rows", fact_rows)
+
+                        if dim_tables:
+                            st.write("**Dimension Tables:**")
+                            for dim in dim_tables:
+                                st.write(f"  â€¢ {dim['name']}: {dim['rows']} unique values")
+                        col_a, col_b, col_c = st.columns(3)
+                        col_a.metric("Source Rows", step_result.get('source_rows', 0))
+                        col_b.metric("Migrated Rows", step_result.get('migrated_rows', 0))
+                        col_c.metric("Target Table", step_result.get('target_table', 'N/A'))
+                    elif step['step'] == 'data_validation':
+                        val_result = step_result
+                        col_a, col_b, col_c = st.columns(3)
+                        col_a.metric("Quality Score", f"{val_result.get('data_quality_score', 0):.1f}%")
+                        col_b.metric("Status", val_result.get('status', 'N/A'))
+                        test_cases = val_result.get('test_cases', [])
+                        for tc in test_cases:
+                            status_emoji = "âœ…" if tc['passed'] else "âŒ"
+                            st.write(f"{status_emoji} **{tc['test'].replace('_', ' ').title()}**: {tc['description']}")
+                            st.write(f"   Expected: {tc['expected']} | Actual: {tc['actual']} | {tc['details']}")
+                        if val_result.get('issues'):
+                            st.warning("**Issues Found:**")
+                            for issue in val_result['issues']:
+                                st.text(f"â€¢ {issue}")
+                        with st.expander("ðŸ“„ Full Validation JSON"):
+                            st.json(val_result)
+            st.divider()
+            validation_step = next((s for s in results.get('steps', []) if s['step'] == 'data_validation'), None)
+            if validation_step:
+                st.subheader("ðŸŽ¯ Final Data Quality Report")
+                val_result = validation_step['result']
+                quality_score = val_result.get('data_quality_score', 0)
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Source Rows", val_result.get('source_row_count', 0))
+                col2.metric("Target Rows", val_result.get('target_row_count', 0))
+                col3.metric("Quality Score", f"{quality_score:.1f}%")
+                status = val_result.get('status', 'UNKNOWN')
+                if status == 'EXCELLENT':
+                    col4.success(f"Status: {status}")
+                elif status == 'GOOD':
+                    col4.info(f"Status: {status}")
+                elif status == 'ACCEPTABLE':
+                    col4.warning(f"Status: {status}")
+                else:
+                    col4.error(f"Status: {status}")
+                st.progress(quality_score / 100.0)
+                if 'quality_metrics' in val_result:
+                    st.write("**Quality Metrics:**")
+                    for key, value in val_result['quality_metrics'].items():
+                        st.metric(key.replace('_', ' ').title(), value)
+            st.divider()
+            st.subheader("ðŸ“¥ Download Results")
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                results_json = json.dumps(results, indent=2, default=str)
+                st.download_button(
+                    label="ðŸ“„ Download Results (JSON)",
+                    data=results_json,
+                    file_name=f"pipeline_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+            with col_d2:
+                csv_data = st.session_state.streaming_data.to_csv(index=False)
+                st.download_button(
+                    label="ðŸ“Š Download Source Data (CSV)",
+                    data=csv_data,
+                    file_name=f"source_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            st.divider()
+            col_a1, col_a2, col_a3 = st.columns(3)
+            with col_a1:
+                if st.button("ðŸ”„ Start New Pipeline", use_container_width=True):
+                    for key in ['intent_result', 'streaming_data', 'workflow_results', 
+                                'streaming_active', 'connection_ok', 'target_connection_ok',
+                                'auto_refresh']:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.session_state.page = 'query'
+                    st.rerun()
+            with col_a2:
+                if st.button("ðŸ“Š View Agent Memory", use_container_width=True):
+                    with st.expander("ðŸ§  Agent Memory & Learning", expanded=True):
+                        st.subheader("Success Patterns")
+                        st.json(st.session_state.memory.success_patterns[-5:])
+                        st.subheader("Error Patterns")
+                        if st.session_state.memory.error_patterns:
+                            st.json(st.session_state.memory.error_patterns[-5:])
+                        else:
+                            st.success("No errors logged!")
+            with col_a3:
+                if st.button("ðŸ“ Open Database", use_container_width=True):
+                    if st.session_state.target_db_type == 'sqlite':
+                        st.info(f"ðŸ“ **Database Location:**\n`{st.session_state.target_config.get('database', 'etl_output.db')}`\nOpen with DB Browser for SQLite.")
+                    else:
+                        st.info(f"ðŸ”— **Database Connection:**\nServer: {st.session_state.target_config.get('server', 'localhost')}\nDatabase: {st.session_state.target_config.get('database', 'N/A')}")
+            if st.button("ðŸ” Inspect Fact Table", key="inspect_fact"):
+                try:
+                    fact_df = st.session_state.orchestrator.db_agent.execute_query(
+                        st.session_state.target_config,
+                        st.session_state.target_db_type,
+                        "SELECT * FROM fact_streaming_data LIMIT 10"
+                    )
+                    st.subheader("Fact Table Preview")
+                    st.dataframe(fact_df)
+                except Exception as e:
+                    st.error(f"Could not read fact table: {e}")
+        else:
+            st.error("âŒ **Pipeline Execution Failed**")
+            error_msg = results.get('error', 'Unknown error occurred')
+            st.code(error_msg)
+            if results.get('steps'):
+                st.warning("âš ï¸ **Partial Results Available:**")
+                for i, step in enumerate(results.get('steps', []), 1):
+                    with st.expander(f"Step {i}: {step.get('step', 'Unknown')}"):
+                        st.json(step.get('result', {}))
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("ðŸ”„ Try Again", use_container_width=True):
+                    st.session_state.page = 'target_config'
+                    st.rerun()
+            with col2:
+                if st.button("ðŸ  Start Over", use_container_width=True):
+                    st.session_state.page = 'query'
+                    st.rerun()
+    else:
+        st.error(f"âŒ Unknown page: {st.session_state.page}")
+        st.info("Resetting to start...")
+        st.session_state.page = 'query'
+        time.sleep(2)
+        st.rerun()
+if __name__ == "__main__":
+    main()

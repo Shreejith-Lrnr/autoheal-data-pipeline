@@ -1047,12 +1047,36 @@ if page == "📥 Upload & Process Data":
             )
         
         with col2:
-            fetch_interval = st.selectbox(
-                "Fetch Interval",
-                options=[30, 60, 300, 900],  # 30sec, 1min, 5min, 15min
-                format_func=lambda x: f"{x} sec" if x < 60 else (f"{x//60} min" if x < 3600 else f"{x//3600} hour"),
-                help="How often to fetch data from this API (shorter = more real-time)"
-            )
+            st.markdown("**Fetch Interval**")
+            interval_col1, interval_col2 = st.columns([1, 1])
+            
+            with interval_col1:
+                interval_value = st.number_input(
+                    "Value",
+                    min_value=1,
+                    max_value=999,
+                    value=30,
+                    step=1,
+                    help="Enter the interval value"
+                )
+            
+            with interval_col2:
+                interval_unit = st.selectbox(
+                    "Unit",
+                    options=["seconds", "minutes", "hours"],
+                    index=0,
+                    help="Select time unit"
+                )
+            
+            # Convert to seconds
+            if interval_unit == "minutes":
+                fetch_interval = interval_value * 60
+            elif interval_unit == "hours":
+                fetch_interval = interval_value * 3600
+            else:
+                fetch_interval = interval_value
+            
+            st.caption(f"⏱️ Fetch every {fetch_interval} seconds ({interval_value} {interval_unit})")
             st.write("")  # Spacing
             if st.button("🔗 Connect API Source", type="primary"):
                 if api_url and api_name:
@@ -1126,31 +1150,31 @@ if page == "📥 Upload & Process Data":
                         # Manual fetch button
                         if st.button(f"🔄 Fetch Now", key=f"fetch_{source['ID']}"):
                             try:
-                                import requests
-                                response = requests.get(source['ApiUrl'], timeout=10)
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    
-                                    # Handle different response structures
-                                    if isinstance(data, dict):
-                                        if 'data' in data and isinstance(data['data'], list):
-                                            data = data['data']
-                                        elif 'results' in data and isinstance(data['results'], list):
-                                            data = data['results']
-                                        elif 'records' in data and isinstance(data['records'], list):
-                                            data = data['records']
-                                        else:
-                                            data = [data]
-                                    
-                                    if isinstance(data, list) and len(data) > 0:
-                                        db.store_api_snapshot(source['ID'], data, "MANUAL_FETCH")
-                                        st.session_state[f"api_preview_{source['ID']}"] = pd.DataFrame(data)
-                                        st.success("✅ Data fetched successfully!")
+                                # Use the improved fetch_and_store_api method that handles nested JSON
+                                result = db.fetch_and_store_api(
+                                    source_id=source['ID'],
+                                    url=source['ApiUrl'],
+                                    method='GET',
+                                    data_format='json',
+                                    timeout=20
+                                )
+                                
+                                # Result can be a DataFrame or raw JSON
+                                if isinstance(result, pd.DataFrame):
+                                    st.session_state[f"api_preview_{source['ID']}"] = result
+                                    st.success(f"✅ Data fetched successfully! ({len(result)} records)")
+                                    st.rerun()
+                                elif isinstance(result, dict) or isinstance(result, list):
+                                    # Try to convert to DataFrame
+                                    try:
+                                        df = pd.DataFrame(result) if isinstance(result, list) else pd.DataFrame([result])
+                                        st.session_state[f"api_preview_{source['ID']}"] = df
+                                        st.success(f"✅ Data fetched successfully! ({len(df)} records)")
                                         st.rerun()
-                                    else:
-                                        st.error("❌ API returned no data or invalid format")
+                                    except Exception as e:
+                                        st.error(f"❌ Could not convert API response to table: {str(e)}")
                                 else:
-                                    st.error(f"❌ API request failed: HTTP {response.status_code}")
+                                    st.error("❌ API returned unexpected data format")
                             except Exception as e:
                                 st.error(f"❌ Fetch failed: {str(e)}")
                         
@@ -1252,6 +1276,126 @@ elif page == "⚙️ Settings & Health":
             st.success(f"✅ Switched to model: {selected_model}")
             st.info("💡 New model will be used for subsequent AI operations")
             st.rerun()
+    
+    # MS SQL Database Ingestion
+    st.subheader("💾 MS SQL Database Ingestion")
+    st.markdown("Connect to external MS SQL databases and import tables for data quality analysis.")
+    
+    # Initialize session state for MS SQL connection
+    if 'mssql_connection_string' not in st.session_state:
+        st.session_state['mssql_connection_string'] = ''
+    if 'mssql_connected' not in st.session_state:
+        st.session_state['mssql_connected'] = False
+    if 'mssql_tables' not in st.session_state:
+        st.session_state['mssql_tables'] = None
+    
+    # Connection string input
+    conn_string = st.text_input(
+        "External MS SQL Connection String",
+        value=st.session_state['mssql_connection_string'],
+        type="password",
+        placeholder="DRIVER={ODBC Driver 17 for SQL Server};SERVER=your_server;DATABASE=your_db;UID=user;PWD=pass",
+        help="Enter ODBC connection string for the external MS SQL database"
+    )
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        if st.button("🔌 Test Connection"):
+            if not conn_string:
+                st.error("Please enter a connection string")
+            else:
+                with st.spinner("Testing connection..."):
+                    result = db.connect_external_mssql(conn_string)
+                    
+                    if result['success']:
+                        st.success(result['message'])
+                        st.session_state['mssql_connection_string'] = conn_string
+                        st.session_state['mssql_connected'] = True
+                        
+                        # Auto-load tables after successful connection
+                        try:
+                            tables_df = db.list_external_tables(conn_string)
+                            st.session_state['mssql_tables'] = tables_df
+                        except Exception as e:
+                            st.warning(f"Connected, but couldn't list tables: {str(e)}")
+                    else:
+                        st.error(result['message'])
+                        st.session_state['mssql_connected'] = False
+                        st.session_state['mssql_tables'] = None
+    
+    with col2:
+        if st.session_state['mssql_connected'] and st.button("🔄 Refresh Tables"):
+            with st.spinner("Loading tables..."):
+                try:
+                    tables_df = db.list_external_tables(st.session_state['mssql_connection_string'])
+                    st.session_state['mssql_tables'] = tables_df
+                    st.success(f"Found {len(tables_df)} tables")
+                except Exception as e:
+                    st.error(f"Failed to list tables: {str(e)}")
+                    st.session_state['mssql_tables'] = None
+    
+    # Display tables if connected
+    if st.session_state['mssql_connected'] and st.session_state['mssql_tables'] is not None:
+        tables_df = st.session_state['mssql_tables']
+        
+        if not tables_df.empty:
+            st.markdown("#### 📊 Available Tables")
+            
+            # Display tables in a nice format
+            st.dataframe(
+                tables_df,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Table import section
+            st.markdown("#### 📥 Import Table")
+            
+            col1, col2, col3 = st.columns([2, 2, 3])
+            
+            with col1:
+                selected_schema = st.selectbox(
+                    "Schema",
+                    options=sorted(tables_df['SchemaName'].unique().tolist())
+                )
+            
+            with col2:
+                # Filter tables by selected schema
+                schema_tables = tables_df[tables_df['SchemaName'] == selected_schema]['TableName'].tolist()
+                selected_table = st.selectbox(
+                    "Table",
+                    options=schema_tables
+                )
+            
+            with col3:
+                dataset_name = st.text_input(
+                    "Dataset Name (optional)",
+                    placeholder="Leave blank for auto-generated name"
+                )
+            
+            if st.button("📥 Import Table", type="primary"):
+                if selected_schema and selected_table:
+                    with st.spinner(f"Importing {selected_schema}.{selected_table}..."):
+                        result = db.import_table_from_mssql(
+                            st.session_state['mssql_connection_string'],
+                            selected_schema,
+                            selected_table,
+                            dataset_name if dataset_name else None
+                        )
+                        
+                        if result['success']:
+                            st.success(result['message'])
+                            st.info(f"✅ Dataset ID: {result['dataset_id']} | Name: {result['dataset_name']}")
+                            st.info("💡 The imported data is now available in the 'Upload & Process Data' page with status 'PENDING'. You can process it through the AutoHeal pipeline.")
+                        else:
+                            st.error(result['message'])
+                else:
+                    st.error("Please select both schema and table")
+        else:
+            st.info("No user tables found in the external database")
+    
+    st.markdown("---")
     
     # Troubleshooting section
     st.subheader("🔧 Troubleshooting")

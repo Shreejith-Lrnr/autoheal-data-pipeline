@@ -579,13 +579,37 @@ class ProductionDatabase:
                 payload = resp.json()
                 # attempt to normalize to tabular if possible
                 try:
-                    df = pd.json_normalize(payload)
+                    # Special handling for nested time-series APIs (like Open-Meteo)
+                    # Check if payload has a nested dict with array values (e.g., 'hourly', 'daily', 'data')
+                    df = None
+                    time_series_keys = ['hourly', 'daily', 'data', 'results', 'records', 'items']
+                    
+                    for key in time_series_keys:
+                        if key in payload and isinstance(payload[key], dict):
+                            nested = payload[key]
+                            # Check if all values in nested dict are lists of same length
+                            if all(isinstance(v, list) for v in nested.values()):
+                                lengths = [len(v) for v in nested.values()]
+                                if len(set(lengths)) == 1 and lengths[0] > 1:
+                                    # Expand nested time-series into rows
+                                    df = pd.DataFrame(nested)
+                                    # Add metadata columns from top level (if any)
+                                    for meta_key, meta_val in payload.items():
+                                        if meta_key != key and not isinstance(meta_val, (dict, list)):
+                                            df[meta_key] = meta_val
+                                    break
+                    
+                    # Fallback to standard normalization if no time-series pattern found
+                    if df is None:
+                        df = pd.json_normalize(payload)
+                    
                     records_count = len(df)
                     stored_id = None
                     if source_id:
                         stored_id = self.store_api_snapshot(source_id, payload, 'json', records_count)
                     return df if df is not None else payload
-                except Exception:
+                except Exception as e:
+                    print(f"JSON normalization error: {e}")
                     # store raw JSON
                     if source_id:
                         stored_id = self.store_api_snapshot(source_id, payload, 'json', None)
@@ -606,3 +630,153 @@ class ProductionDatabase:
         except Exception as e:
             print(f"Error fetching API ({url}): {str(e)}")
             raise
+    
+    # ========== MS SQL External Database Connection Methods ==========
+    
+    def connect_external_mssql(self, connection_string):
+        """
+        Test connection to external MS SQL database
+        
+        Args:
+            connection_string: ODBC connection string for external database
+            
+        Returns:
+            dict with 'success' (bool) and 'message' (str)
+        """
+        try:
+            # Try connecting to external database
+            conn = pyodbc.connect(connection_string, timeout=10)
+            
+            # Test by fetching server info
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@VERSION")
+            version = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'Successfully connected to external MS SQL database. Server version: {version[:80]}...'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Connection failed: {str(e)}'
+            }
+    
+    def list_external_tables(self, connection_string):
+        """
+        List all tables from external MS SQL database
+        
+        Args:
+            connection_string: ODBC connection string for external database
+            
+        Returns:
+            DataFrame with columns: SchemaName, TableName, RowCount (estimated)
+        """
+        try:
+            conn = pyodbc.connect(connection_string, timeout=10)
+            cursor = conn.cursor()
+            
+            # Get all user tables with row counts
+            query = """
+            SELECT 
+                s.name AS SchemaName,
+                t.name AS TableName,
+                SUM(p.rows) AS RowCount
+            FROM 
+                sys.tables t
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                INNER JOIN sys.partitions p ON t.object_id = p.object_id
+            WHERE 
+                p.index_id IN (0,1)  -- heap or clustered index
+                AND t.is_ms_shipped = 0  -- exclude system tables
+            GROUP BY 
+                s.name, t.name
+            ORDER BY 
+                s.name, t.name
+            """
+            
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            
+            tables = []
+            for row in rows:
+                tables.append({
+                    'SchemaName': row.SchemaName,
+                    'TableName': row.TableName,
+                    'RowCount': row.RowCount
+                })
+            
+            cursor.close()
+            conn.close()
+            
+            return pd.DataFrame(tables)
+        except Exception as e:
+            raise Exception(f"Failed to list tables: {str(e)}")
+    
+    def import_table_from_mssql(self, connection_string, schema_name, table_name, dataset_name=None):
+        """
+        Import a table from external MS SQL database and process it through the pipeline
+        
+        Args:
+            connection_string: ODBC connection string for external database
+            schema_name: Schema of the table to import
+            table_name: Name of the table to import
+            dataset_name: Optional custom name for the imported dataset
+            
+        Returns:
+            dict with 'success', 'dataset_id', 'rows_imported', 'message'
+        """
+        try:
+            # Connect to external database
+            conn = pyodbc.connect(connection_string, timeout=30)
+            
+            # Fetch the table data
+            query = f"SELECT * FROM [{schema_name}].[{table_name}]"
+            df = pd.read_sql(query, conn)
+            conn.close()
+            
+            rows_imported = len(df)
+            
+            # Use provided name or construct one
+            if not dataset_name:
+                dataset_name = f"{schema_name}_{table_name}_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Convert DataFrame to JSON for storage
+            original_data = df.to_json(orient='records')
+            
+            # Store in ProcessedData table with initial status
+            local_conn = self.get_connection()
+            cursor = local_conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO ProcessedData 
+                (DatasetName, OriginalData, ProcessedData, Status, ProcessingTimestamp, ProcessedSize)
+                VALUES (?, ?, NULL, 'PENDING', GETDATE(), ?)
+            """, (dataset_name, original_data, rows_imported))
+            
+            local_conn.commit()
+            
+            # Get the inserted dataset ID
+            cursor.execute("SELECT @@IDENTITY")
+            dataset_id = cursor.fetchone()[0]
+            
+            cursor.close()
+            local_conn.close()
+            
+            return {
+                'success': True,
+                'dataset_id': int(dataset_id),
+                'rows_imported': rows_imported,
+                'message': f'Successfully imported {rows_imported} rows from {schema_name}.{table_name}',
+                'dataset_name': dataset_name
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'dataset_id': None,
+                'rows_imported': 0,
+                'message': f'Import failed: {str(e)}',
+                'dataset_name': dataset_name if dataset_name else None
+            }
