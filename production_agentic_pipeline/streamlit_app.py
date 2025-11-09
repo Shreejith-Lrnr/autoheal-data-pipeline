@@ -2,14 +2,14 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 import time
 
 from config import Config
 from database import ProductionDatabase
-from agents import PipelineOrchestratorAgent, DataHealingAgent
+from agents import PipelineOrchestratorAgent, DataHealingAgent, DataQualityAgent
 from real_time_monitor import get_monitor
 
 # --- Robust file loader for uploads ---
@@ -52,9 +52,19 @@ st.set_page_config(
 @st.cache_resource
 def init_components():
     Config.validate_config()
-    return ProductionDatabase(), PipelineOrchestratorAgent(), DataHealingAgent(), get_monitor()
+    db = ProductionDatabase()
+    orchestrator = PipelineOrchestratorAgent()
+    healing_agent = DataHealingAgent()
+    quality_agent = DataQualityAgent()
+    rt_monitor = get_monitor()
+    
+    # Auto-start the real-time monitor for API fetching
+    if not rt_monitor.get_status()['running']:
+        rt_monitor.start_monitoring()
+    
+    return db, orchestrator, healing_agent, quality_agent, rt_monitor
 
-db, orchestrator, healing_agent, rt_monitor = init_components()
+db, orchestrator, healing_agent, quality_agent, rt_monitor = init_components()
 
 # Real-time notifications
 def show_real_time_notifications():
@@ -85,16 +95,19 @@ page = st.sidebar.selectbox(
 # Real-Time Monitor Controls in Sidebar
 st.sidebar.markdown("---")
 st.sidebar.markdown("**⚡ Real-Time Monitor**")
+st.sidebar.markdown("*Auto-started for API fetching*")
 
 monitor_status = rt_monitor.get_status()
 if monitor_status['running']:
     st.sidebar.success("🟢 Monitor Active")
+    st.sidebar.caption("Automatically fetching APIs based on intervals")
     if st.sidebar.button("⏹️ Stop Monitor"):
         rt_monitor.stop_monitoring()
         st.sidebar.success("Monitor stopped")
         st.rerun()
 else:
     st.sidebar.error("🔴 Monitor Stopped")
+    st.sidebar.caption("API auto-fetching disabled")
     if st.sidebar.button("🚀 Start Monitor"):
         rt_monitor.start_monitoring()
         st.sidebar.success("Monitor started!")
@@ -103,8 +116,12 @@ else:
 # Quick metrics in sidebar
 if monitor_status['running']:
     metrics = rt_monitor.get_system_metrics()
+    api_stats = rt_monitor.get_api_fetch_stats()
+    
     st.sidebar.metric("Active Jobs", metrics['active_jobs'])
     st.sidebar.metric("Today's Quality", f"{metrics['avg_quality_today']:.1f}%")
+    st.sidebar.metric("API Sources", f"{api_stats['active_sources']}/{api_stats['total_sources']}")
+    st.sidebar.metric("API Fetches Today", api_stats['snapshots_today'])
 
 if page == "📥 Upload & Process Data":
     st.title("🩺 AutoHeal Data Pipeline: Upload & Process")
@@ -254,19 +271,73 @@ if page == "📥 Upload & Process Data":
         
         # Process Dataset Button
         if st.button("🩺 Auto-Heal Data", type="primary"):
-            with st.spinner("🩺 Auto-healing in progress..."):
-                try:
-                    processing_result, dataset_id = orchestrator.process_dataset(df, current_dataset_name)
-                    
-                    st.session_state.processing_result = processing_result
-                    st.session_state.current_dataset_id = dataset_id
-                    st.session_state.current_df = df
-                    
+            # Create progress tracking containers
+            progress_container = st.container()
+            status_container = st.container()
+            
+            with progress_container:
+                progress_bar = st.progress(0)
+                progress_text = st.empty()
+            
+            with status_container:
+                status_text = st.empty()
+            
+            try:
+                # Step 1: Dataset Storage (10%)
+                progress_text.text("📦 Storing dataset in database...")
+                progress_bar.progress(10)
+                status_text.info("🔄 Step 1/6: Dataset Storage - Saving your data securely...")
+                
+                # Step 2: Quality Analysis (30%)
+                progress_text.text("🔍 Analyzing data quality...")
+                progress_bar.progress(30)
+                status_text.info("🔄 Step 2/6: Quality Analysis - Scanning for issues...")
+                
+                # Step 3: Healing Plan Generation (50%)
+                progress_text.text("🧠 Generating healing plan with AI...")
+                progress_bar.progress(50)
+                status_text.info("🔄 Step 3/6: AI Planning - Creating intelligent healing strategies...")
+                
+                # Step 4: Auto-Execution (70%)
+                progress_text.text("� Auto-executing high-confidence actions...")
+                progress_bar.progress(70)
+                status_text.info("🔄 Step 4/6: Auto-Healing - Applying safe, automated fixes...")
+                
+                # Step 5: Approval Preparation (90%)
+                progress_text.text("📋 Preparing actions for approval...")
+                progress_bar.progress(90)
+                status_text.info("🔄 Step 5/6: Review Preparation - Setting up human oversight...")
+                
+                # Step 6: Final Summary (100%)
+                progress_text.text("📊 Generating executive summary...")
+                progress_bar.progress(100)
+                status_text.info("🔄 Step 6/6: Final Summary - Creating business impact assessment...")
+                
+                # Actually run the processing
+                processing_result, dataset_id = orchestrator.process_dataset(df, current_dataset_name)
+                
+                # Clear progress indicators
+                progress_container.empty()
+                status_container.empty()
+                
+                st.session_state.processing_result = processing_result
+                st.session_state.current_dataset_id = dataset_id
+                # Store the dataframe WITH auto-executed changes
+                st.session_state.current_df = processing_result.get('current_df', df)
+                
+                # Show summary of auto-executed actions
+                auto_count = len(processing_result.get('auto_executed_actions', []))
+                if auto_count > 0:
+                    st.success(f"✅ Auto-healing complete! 🤖 {auto_count} action(s) auto-executed autonomously.")
+                else:
                     st.success("✅ Auto-healing analysis complete!")
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Processing error: {str(e)}")
+                st.rerun()
+                
+            except Exception as e:
+                # Clear progress indicators on error
+                progress_container.empty()
+                status_container.empty()
+                st.error(f"Processing error: {str(e)}")
 
     # Display Processing Results
     if 'processing_result' in st.session_state:
@@ -277,7 +348,99 @@ if page == "📥 Upload & Process Data":
         # Executive Summary
         if 'ai_executive_summary' in result:
             st.markdown("### 📈 Pipeline Executive Summary")
-            st.info(result['ai_executive_summary'])
+
+            # Function to highlight quality score and issues in the summary
+            def highlight_summary_metrics(summary_text, quality_score, issues_count):
+                # Highlight quality score with color based on value
+                if quality_score >= 80:
+                    score_color = "#10b981"  # green-500
+                elif quality_score >= 60:
+                    score_color = "#f59e0b"  # amber-500
+                else:
+                    score_color = "#ef4444"  # red-500
+
+                # Highlight issues count
+                issues_color = "#f97316"  # orange-500
+
+                # Replace quality score mentions
+                import re
+                summary_text = re.sub(
+                    r'(\d+(?:\.\d+)?)/100',
+                    f'<span style="color: {score_color}; font-weight: bold;">\\1/100</span>',
+                    summary_text
+                )
+
+                # Replace issues count mentions
+                summary_text = re.sub(
+                    r'(\d+)\s*(?:issues?|problems?)',
+                    f'<span style="color: {issues_color}; font-weight: bold;">\\1 issues</span>',
+                    summary_text,
+                    flags=re.IGNORECASE
+                )
+
+                return summary_text
+
+            highlighted_summary = highlight_summary_metrics(
+                result['ai_executive_summary'],
+                result['quality_report']['quality_score'],
+                len(result['quality_report']['issues'])
+            )
+
+            st.markdown(
+                f'<div style="background-color: rgba(59, 130, 246, 0.1); border-left: 4px solid #3b82f6; padding: 12px; border-radius: 4px;">{highlighted_summary}</div>',
+                unsafe_allow_html=True
+            )
+        
+        # ========== AUTO-EXECUTED ACTIONS SECTION ==========
+        if result.get('auto_executed_actions'):
+            st.markdown("### ✅ Auto-Executed Actions (High Confidence)")
+            st.success(f"🤖 Agent autonomously executed {len(result['auto_executed_actions'])} high-confidence healing actions")
+            
+            for i, auto_action in enumerate(result['auto_executed_actions']):
+                action = auto_action['action']
+                exec_log = auto_action['execution_log']
+                confidence = auto_action['confidence']
+                
+                with st.expander(f"✓ {action['type'].replace('_', ' ').title()} - {confidence:.0%} Confidence (Auto-Executed)", expanded=False):
+                    # Show confidence and risk
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Confidence", f"{confidence:.0%}")
+                    with col2:
+                        st.metric("Risk Level", action.get('risk_level', 'LOW'))
+                    with col3:
+                        st.metric("Affected Rows", action.get('affected_rows', 0))
+                    with col4:
+                        status_icon = "✅" if exec_log['success'] else "❌"
+                        st.metric("Status", f"{status_icon} {'Success' if exec_log['success'] else 'Failed'}")
+                    
+                    # Show reasoning (chain of thought)
+                    if 'reasoning' in action:
+                        st.markdown("**🧠 Agent Reasoning:**")
+                        reasoning = action['reasoning']
+                        
+                        st.write("**Thought Process:**")
+                        for thought in reasoning.get('thought_process', []):
+                            st.write(f"• {thought}")
+                        
+                        if reasoning.get('alternatives'):
+                            st.write("**Alternatives Considered:**")
+                            for alt in reasoning['alternatives']:
+                                st.write(f"  - {alt}")
+                        
+                        if reasoning.get('risks'):
+                            st.warning("**Risks Identified:**")
+                            for risk in reasoning['risks']:
+                                st.write(f"  ⚠️ {risk}")
+                    
+                    # Show execution details
+                    st.markdown("**📊 Execution Details:**")
+                    st.write(f"**Method Used:** {action.get('recommended_method', 'N/A').replace('_', ' ').title()}")
+                    st.write(f"**Column:** {action.get('column', 'Multiple')}")
+                    st.write(f"**Original Shape:** {exec_log.get('original_shape', 'N/A')}")
+                    st.write(f"**Final Shape:** {exec_log.get('final_shape', 'N/A')}")
+                    st.write(f"**Records Modified:** {exec_log.get('records_affected', 0)}")
+                    st.info(f"ℹ️ {exec_log.get('message', 'Action executed successfully')}")
         
         # Quality Score
         quality_score = result['quality_report']['quality_score']
@@ -348,104 +511,157 @@ if page == "📥 Upload & Process Data":
             col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
                 select_all = st.checkbox("Select All Actions", key="select_all_approvals")
+                
+                # Handle select all logic immediately
+                if select_all:
+                    all_indices = list(range(len(result['human_approvals_needed'])))
+                    if st.session_state.get('selected_approvals', []) != all_indices:
+                        st.session_state.selected_approvals = all_indices
+                        st.rerun()
+                elif st.session_state.get('selected_approvals', []) == list(range(len(result['human_approvals_needed']))):
+                    # If all are selected but checkbox is unchecked, clear selections
+                    st.session_state.selected_approvals = []
+                    st.rerun()
             with col2:
                 if st.button("✅ Approve Selected", type="primary", disabled=not st.session_state.get('selected_approvals', [])):
                     selected_indices = st.session_state.get('selected_approvals', [])
                     if selected_indices:
-                        approved_count = 0
-                        failed_count = 0
-
-                        for i in selected_indices:
+                        # ========== OPTIMIZED BATCH PROCESSING ==========
+                        
+                        # Show progress indicators
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        # Step 1: Execute ALL healing actions first (batch processing)
+                        execution_results = []
+                        current_df = st.session_state.current_df.copy()
+                        
+                        status_text.text(f"⚙️ Processing {len(selected_indices)} healing actions...")
+                        
+                        for idx, i in enumerate(selected_indices):
                             if i < len(result['human_approvals_needed']):
                                 approval = result['human_approvals_needed'][i]
                                 action_to_execute = result['healing_plan']['actions'][i]
-
-                                # Log approval decision
-                                approval_action_id = db.log_agent_action(
-                                    st.session_state.current_dataset_id,
-                                    "HumanOperator",
-                                    f"APPROVED_{approval['action_type']}",
-                                    f"Bulk approved {approval['action_type']} - {approval['impact']}",
-                                    "EXECUTING"
-                                )
-
-                                # Execute the healing action
                                 recommended_method = approval['recommendation']['method'] if approval.get('recommendation') else 'default'
-
+                                
                                 try:
+                                    # Execute healing (no DB writes yet)
                                     cleaned_df, exec_log = healing_agent.execute_healing_action(
-                                        st.session_state.current_df,
+                                        current_df,
                                         action_to_execute,
                                         recommended_method
                                     )
-
+                                    
                                     if exec_log['success']:
-                                        st.session_state.current_df = cleaned_df
-                                        st.session_state.execution_logs = st.session_state.get('execution_logs', [])
-                                        st.session_state.execution_logs.append(exec_log)
-
-                                        # Recalculate quality score after healing
-                                        new_quality_score = healing_agent.recalculate_quality_score(cleaned_df)
-
-                                        # Update approval action with success
-                                        db.update_agent_action(approval_action_id, "COMPLETED", "APPROVED")
-
-                                        # Store the cleaned data with new quality score
-                                        db.update_dataset_quality_score(
-                                            st.session_state.current_dataset_id,
-                                            new_quality_score,
-                                            cleaned_df,
-                                            "HEALING_IN_PROGRESS"
-                                        )
-
-                                        # Log detailed execution results
-                                        db.log_agent_action(
-                                            st.session_state.current_dataset_id,
-                                            "DataHealingAgent",
-                                            f"EXECUTED_{action_to_execute['type']}",
-                                            f"Bulk executed {recommended_method} - Records affected: {exec_log.get('records_affected', 0)}, New Quality Score: {new_quality_score:.1f}/100",
-                                            "COMPLETED"
-                                        )
-
-                                        approved_count += 1
+                                        current_df = cleaned_df  # Update for next action
+                                        execution_results.append({
+                                            'approval': approval,
+                                            'action': action_to_execute,
+                                            'method': recommended_method,
+                                            'exec_log': exec_log,
+                                            'success': True
+                                        })
                                     else:
-                                        # Update approval action with failure
-                                        db.update_agent_action(approval_action_id, "FAILED", "APPROVED")
-
-                                        # Log failure details
-                                        db.log_agent_action(
-                                            st.session_state.current_dataset_id,
-                                            "DataHealingAgent",
-                                            f"FAILED_{action_to_execute['type']}",
-                                            f"Bulk execution failed using {recommended_method}: {exec_log['message']}",
-                                            "FAILED"
-                                        )
-
-                                        failed_count += 1
-
+                                        execution_results.append({
+                                            'approval': approval,
+                                            'action': action_to_execute,
+                                            'method': recommended_method,
+                                            'exec_log': exec_log,
+                                            'success': False
+                                        })
                                 except Exception as e:
-                                    failed_count += 1
-                                    db.update_agent_action(approval_action_id, "FAILED", "APPROVED")
-                                    db.log_agent_action(
-                                        st.session_state.current_dataset_id,
-                                        "DataHealingAgent",
-                                        f"FAILED_{action_to_execute['type']}",
-                                        f"Bulk execution error: {str(e)}",
-                                        "FAILED"
-                                    )
-
-                        # Show bulk results
+                                    execution_results.append({
+                                        'approval': approval,
+                                        'action': action_to_execute,
+                                        'method': recommended_method,
+                                        'exec_log': {'success': False, 'message': str(e)},
+                                        'success': False,
+                                        'error': str(e)
+                                    })
+                                
+                                # Update progress
+                                progress_bar.progress((idx + 1) / len(selected_indices))
+                        
+                        # Step 2: Calculate quality score ONCE after all actions
+                        status_text.text("📊 Calculating final quality score...")
+                        final_quality_score = healing_agent.recalculate_quality_score(current_df)
+                        
+                        # Step 3: Batch write to database (single transaction is faster)
+                        status_text.text("💾 Saving results to database...")
+                        
+                        approved_count = sum(1 for r in execution_results if r['success'])
+                        failed_count = len(execution_results) - approved_count
+                        
+                        # Prepare all actions for batch logging (single DB transaction = MUCH faster)
+                        batch_actions = []
+                        for result_item in execution_results:
+                            if result_item['success']:
+                                # Log approval
+                                batch_actions.append({
+                                    'dataset_id': st.session_state.current_dataset_id,
+                                    'agent_name': "HumanOperator",
+                                    'action_type': f"APPROVED_{result_item['approval']['action_type']}",
+                                    'action_details': f"Bulk approved {result_item['approval']['action_type']} - {result_item['approval']['impact']}",
+                                    'execution_status': "COMPLETED",
+                                    'human_approval': "APPROVED"
+                                })
+                                
+                                # Log execution
+                                batch_actions.append({
+                                    'dataset_id': st.session_state.current_dataset_id,
+                                    'agent_name': "DataHealingAgent",
+                                    'action_type': f"EXECUTED_{result_item['action']['type']}",
+                                    'action_details': f"Bulk executed {result_item['method']} - Records affected: {result_item['exec_log'].get('records_affected', 0)}",
+                                    'execution_status': "COMPLETED",
+                                    'human_approval': None
+                                })
+                            else:
+                                # Log failure
+                                batch_actions.append({
+                                    'dataset_id': st.session_state.current_dataset_id,
+                                    'agent_name': "DataHealingAgent",
+                                    'action_type': f"FAILED_{result_item['action']['type']}",
+                                    'action_details': f"Bulk execution failed: {result_item['exec_log'].get('message', 'Unknown error')}",
+                                    'execution_status': "FAILED",
+                                    'human_approval': None
+                                })
+                        
+                        # Batch log all actions in a single transaction (10-20x faster than individual logs)
+                        if batch_actions:
+                            db.batch_log_agent_actions(batch_actions)
+                        
+                        # Store final cleaned data ONCE
                         if approved_count > 0:
-                            final_quality_score = healing_agent.recalculate_quality_score(st.session_state.current_df)
-                            st.success(f"✅ Bulk approval completed! {approved_count} actions approved successfully. Final quality score: {final_quality_score:.1f}/100")
+                            db.update_dataset_quality_score(
+                                st.session_state.current_dataset_id,
+                                final_quality_score,
+                                current_df,
+                                "HEALING_IN_PROGRESS"
+                            )
+                            
+                            # Update session state with final df
+                            st.session_state.current_df = current_df
+                            st.session_state.execution_logs = st.session_state.get('execution_logs', [])
+                            st.session_state.execution_logs.extend([r['exec_log'] for r in execution_results if r['success']])
+                        
+                        # Clear progress indicators
+                        progress_bar.empty()
+                        status_text.empty()
+                        
+                        # Show final results
+                        if approved_count > 0:
+                            st.success(f"✅ Bulk approval completed! {approved_count} actions processed successfully. Final quality score: {final_quality_score:.1f}/100")
                             if failed_count > 0:
                                 st.warning(f"⚠️ {failed_count} actions failed during execution.")
                         else:
                             st.error(f"❌ All {failed_count} selected actions failed to execute.")
-
+                        
                         # Clear selections and rerun
                         if 'selected_approvals' in st.session_state:
                             del st.session_state.selected_approvals
+                        
+                        import time
+                        time.sleep(1)  # Brief pause to show completion message
                         st.rerun()
 
             with col3:
@@ -509,6 +725,7 @@ if page == "📥 Upload & Process Data":
                             recommended_method = approval['recommendation']['method'] if approval.get('recommendation') else 'default'
 
                             with st.spinner(f"Executing {approval['action_type']}..."):
+                                # Execute healing action
                                 cleaned_df, exec_log = healing_agent.execute_healing_action(
                                     st.session_state.current_df,
                                     action_to_execute,
@@ -516,25 +733,30 @@ if page == "📥 Upload & Process Data":
                                 )
 
                                 if exec_log['success']:
+                                    # Update in-memory state
                                     st.session_state.current_df = cleaned_df
                                     st.session_state.execution_logs = st.session_state.get('execution_logs', [])
                                     st.session_state.execution_logs.append(exec_log)
 
+                                    # Calculate quality score
                                     new_quality_score = healing_agent.recalculate_quality_score(cleaned_df)
+                                    
+                                    # Batch database operations (faster)
                                     db.update_agent_action(approval_action_id, "COMPLETED", "APPROVED")
-                                    db.update_dataset_quality_score(
-                                        st.session_state.current_dataset_id,
-                                        new_quality_score,
-                                        cleaned_df,
-                                        "HEALING_IN_PROGRESS"
-                                    )
-
                                     db.log_agent_action(
                                         st.session_state.current_dataset_id,
                                         "DataHealingAgent",
                                         f"EXECUTED_{action_to_execute['type']}",
                                         f"Single executed {recommended_method} - Records affected: {exec_log.get('records_affected', 0)}, New Quality Score: {new_quality_score:.1f}/100",
                                         "COMPLETED"
+                                    )
+                                    
+                                    # Store DataFrame LAST (most expensive operation)
+                                    db.update_dataset_quality_score(
+                                        st.session_state.current_dataset_id,
+                                        new_quality_score,
+                                        cleaned_df,
+                                        "HEALING_IN_PROGRESS"
                                     )
 
                                     st.success(f"✅ Action completed successfully! Quality score: {new_quality_score:.1f}/100")
@@ -567,101 +789,90 @@ if page == "📥 Upload & Process Data":
                         # Show alternative solution input if rejection was clicked
                         if f"rejection_feedback_{i}" in st.session_state:
                             with reject_col2:
-                                with st.expander("💡 Provide Alternative Solution", expanded=True):
-                                    alternative_method = st.selectbox(
-                                        "Alternative Healing Method",
-                                        options=[
-                                            "None (just reject)",
-                                            "FILL_MEAN", "FILL_MEDIAN", "FILL_MODE", "FILL_FORWARD", "FILL_BACKWARD",
-                                            "DROP_ROWS", "DROP_COLUMNS", 
-                                            "OUTLIER_IQR", "OUTLIER_ZSCORE", "OUTLIER_PERCENTILE",
-                                            "DUPLICATE_REMOVE", "DUPLICATE_KEEP_FIRST", "DUPLICATE_KEEP_LAST",
-                                            "CUSTOM_TRANSFORMATION"
-                                        ],
-                                        key=f"alt_method_{i}",
-                                        help="Choose an alternative healing approach or select 'None' to just reject"
-                                    )
-                                    
-                                    custom_notes = st.text_area(
-                                        "Additional Notes (Optional)",
-                                        placeholder="Explain why this alternative is better, or provide custom instructions...",
-                                        height=60,
-                                        key=f"custom_notes_{i}"
-                                    )
-                                    
-                                    feedback_rating = st.slider(
-                                        "How confident are you in this alternative?",
-                                        min_value=1, max_value=5, value=4,
-                                        help="1 = Not confident, 5 = Very confident",
-                                        key=f"rating_{i}"
-                                    )
-                                    
-                                    col_a, col_b = st.columns(2)
-                                    with col_a:
-                                        if st.button("✅ Submit Alternative & Reject", 
-                                                   key=f"submit_alt_{i}", type="primary"):
-                                            # Log the rejection with alternative solution
-                                            rejection_details = st.session_state[f"rejection_feedback_{i}"]
+                                st.markdown("#### 💡 Provide Alternative Solution")
+                                alternative_method = st.selectbox(
+                                    "Alternative Healing Method",
+                                    options=[
+                                        "None (just reject)",
+                                        "FILL_MEAN", "FILL_MEDIAN", "FILL_MODE", "FILL_FORWARD", "FILL_BACKWARD",
+                                        "DROP_ROWS", "DROP_COLUMNS", 
+                                        "OUTLIER_IQR", "OUTLIER_ZSCORE", "OUTLIER_PERCENTILE",
+                                        "DUPLICATE_REMOVE", "DUPLICATE_KEEP_FIRST", "DUPLICATE_KEEP_LAST",
+                                        "CUSTOM_TRANSFORMATION"
+                                    ],
+                                    key=f"alt_method_{i}",
+                                    help="Choose an alternative healing approach or select 'None' to just reject"
+                                )
+                                
+                                custom_notes = st.text_area(
+                                    "Additional Notes (Optional)",
+                                    placeholder="Explain why this alternative is better, or provide custom instructions...",
+                                    height=60,
+                                    key=f"custom_notes_{i}"
+                                )
+                                
+                                feedback_rating = st.slider(
+                                    "How confident are you in this alternative?",
+                                    min_value=1, max_value=5, value=4,
+                                    help="1 = Not confident, 5 = Very confident",
+                                    key=f"rating_{i}"
+                                )
+                                
+                                col_a, col_b = st.columns(2)
+                                with col_a:
+                                    if st.button("✅ Submit Alternative & Reject", 
+                                               key=f"submit_alt_{i}", type="primary"):
+                                        # Log the rejection with alternative solution
+                                        rejection_details = st.session_state[f"rejection_feedback_{i}"]
+                                        
+                                        action_id = db.log_agent_action(
+                                            st.session_state.current_dataset_id,
+                                            "HumanOperator",
+                                            f"REJECTED_WITH_ALTERNATIVE_{rejection_details['action_type']}",
+                                            f"Rejected {rejection_details['action_type']} - Impact: {rejection_details['impact']} - Alternative: {alternative_method}",
+                                            "REJECTED"
+                                        )
+                                        
+                                        # Store human feedback with alternative solution
+                                        if orchestrator and hasattr(orchestrator, 'learning_system'):
+                                            feedback_text = f"Rejected: {rejection_details['action_type']}. Alternative: {alternative_method}"
+                                            if custom_notes.strip():
+                                                feedback_text += f". Notes: {custom_notes}"
                                             
-                                            action_id = db.log_agent_action(
-                                                st.session_state.current_dataset_id,
-                                                "HumanOperator",
-                                                f"REJECTED_WITH_ALTERNATIVE_{rejection_details['action_type']}",
-                                                f"Rejected {rejection_details['action_type']} - Impact: {rejection_details['impact']} - Alternative: {alternative_method}",
-                                                "REJECTED"
+                                            orchestrator.learning_system.store_human_feedback(
+                                                agent_name="DataHealingAgent",
+                                                action_id=action_id,
+                                                feedback_type="rejection_with_alternative",
+                                                feedback_text=feedback_text,
+                                                rating=feedback_rating,
+                                                context=f"Dataset: {st.session_state.get('dataset_name', 'Unknown')} - Column: {approval.get('column', 'N/A')}"
                                             )
-                                            
-                                            # Store human feedback with alternative solution
-                                            if orchestrator and hasattr(orchestrator, 'learning_system'):
-                                                feedback_text = f"Rejected: {rejection_details['action_type']}. Alternative: {alternative_method}"
-                                                if custom_notes.strip():
-                                                    feedback_text += f". Notes: {custom_notes}"
-                                                
-                                                orchestrator.learning_system.store_human_feedback(
-                                                    agent_name="DataHealingAgent",
-                                                    action_id=action_id,
-                                                    feedback_type="rejection_with_alternative",
-                                                    feedback_text=feedback_text,
-                                                    rating=feedback_rating,
-                                                    context=f"Dataset: {st.session_state.get('dataset_name', 'Unknown')} - Column: {approval.get('column', 'N/A')}"
-                                                )
-                                            
-                                            st.success(f"✅ Rejection logged with alternative solution: {alternative_method}")
-                                            
-                                            # Clear the feedback state
-                                            del st.session_state[f"rejection_feedback_{i}"]
-                                            st.rerun()
-                                            
-                                    with col_b:
-                                        if st.button("❌ Just Reject (No Alternative)", 
-                                                   key=f"just_reject_{i}"):
-                                            # Simple rejection without alternative
-                                            rejection_details = st.session_state[f"rejection_feedback_{i}"]
-                                            
-                                            db.log_agent_action(
-                                                st.session_state.current_dataset_id,
-                                                "HumanOperator",
-                                                f"REJECTED_{rejection_details['action_type']}",
-                                                f"Single rejected {rejection_details['action_type']} - Impact: {rejection_details['impact']}",
-                                                "REJECTED"
-                                            )
-                                            
-                                            st.warning(f"❌ Action rejected. Issue logged for manual review.")
-                                            
-                                            # Clear the feedback state
-                                            del st.session_state[f"rejection_feedback_{i}"]
-                                            st.rerun()
-
-            # Update select all checkbox
-            if select_all:
-                all_indices = list(range(len(result['human_approvals_needed'])))
-                if st.session_state.selected_approvals != all_indices:
-                    st.session_state.selected_approvals = all_indices
-                    st.rerun()
-            elif st.session_state.selected_approvals == list(range(len(result['human_approvals_needed']))):
-                # If all are selected but checkbox is unchecked, clear selections
-                st.session_state.selected_approvals = []
-                st.rerun()
+                                        
+                                        st.success(f"✅ Rejection logged with alternative solution: {alternative_method}")
+                                        
+                                        # Clear the feedback state
+                                        del st.session_state[f"rejection_feedback_{i}"]
+                                        st.rerun()
+                                        
+                                with col_b:
+                                    if st.button("❌ Just Reject (No Alternative)", 
+                                               key=f"just_reject_{i}"):
+                                        # Simple rejection without alternative
+                                        rejection_details = st.session_state[f"rejection_feedback_{i}"]
+                                        
+                                        db.log_agent_action(
+                                            st.session_state.current_dataset_id,
+                                            "HumanOperator",
+                                            f"REJECTED_{rejection_details['action_type']}",
+                                            f"Single rejected {rejection_details['action_type']} - Impact: {rejection_details['impact']}",
+                                            "REJECTED"
+                                        )
+                                        
+                                        st.warning(f"❌ Action rejected. Issue logged for manual review.")
+                                        
+                                        # Clear the feedback state
+                                        del st.session_state[f"rejection_feedback_{i}"]
+                                        st.rerun()
 
             # Bulk Rejection Feedback Collection
             if 'bulk_rejection_indices' in st.session_state and st.session_state.bulk_rejection_indices:
@@ -784,7 +995,20 @@ if page == "📥 Upload & Process Data":
             
             if all_actions_complete:
                 # Final quality score calculation
-                final_quality_score = healing_agent.recalculate_quality_score(st.session_state.current_df)
+                with st.spinner("📊 Calculating final quality score..."):
+                    final_quality_score = healing_agent.recalculate_quality_score(st.session_state.current_df)
+                
+                # Update the processing_result with the final quality report
+                if 'processing_result' in st.session_state:
+                    # Create updated quality report with final score
+                    final_quality_report = st.session_state.processing_result.get('quality_report', {}).copy()
+                    final_quality_report['quality_score'] = final_quality_score
+                    final_quality_report['healing_completed'] = True
+                    final_quality_report['final_quality_score'] = final_quality_score
+                    
+                    # Update the processing_result
+                    st.session_state.processing_result['quality_report'] = final_quality_report
+                    st.session_state.processing_result['final_quality_score'] = final_quality_score
                 
                 # Mark dataset as fully completed
                 db.update_dataset_quality_score(
@@ -865,8 +1089,9 @@ if page == "📥 Upload & Process Data":
         
         # Real-time metrics
         metrics = rt_monitor.get_system_metrics()
+        api_stats = rt_monitor.get_api_fetch_stats()
         
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             st.metric("Datasets Today", metrics['datasets_today'])
         with col2:
@@ -878,49 +1103,39 @@ if page == "📥 Upload & Process Data":
         with col5:
             quality_color = "normal" if metrics['quality_alerts'] == 0 else "inverse"
             st.metric("Quality Alerts", metrics['quality_alerts'], delta=None)
+        with col6:
+            st.metric("API Fetches (1h)", api_stats['recent_fetches'])
         
         # Live Activity Feed
         st.subheader("📡 Live Activity Feed")
         
-        recent_actions = rt_monitor.get_recent_agent_actions(10)
+        recent_actions = rt_monitor.get_recent_activity()
         
-        if not recent_actions.empty:
-            for _, action in recent_actions.iterrows():
-                # Color coding for different statuses
-                status_colors = {
-                    'COMPLETED': '🟢',
-                    'EXECUTING': '🟡',
-                    'PENDING_APPROVAL': '🟡',
-                    'FAILED': '🔴',
-                    'REJECTED': '🔴',
-                    'AUTO_APPROVED': '🟢'
-                }
-                
-                status_icon = status_colors.get(action['ExecutionStatus'], '⚫')
-                
+        if recent_actions:
+            for action in recent_actions[-10:]:  # Show last 10 activities
                 with st.container():
-                    col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
+                    col1, col2 = st.columns([4, 1])
                     with col1:
-                        st.write(f"**{action['AgentName']}**: {action['ActionType']}")
+                        st.write(f"**{action['timestamp'].strftime('%H:%M:%S')}**: {action['message']}")
                     with col2:
-                        # Truncate long details
-                        details = str(action['ActionDetails'])
-                        if len(details) > 50:
-                            details = details[:50] + "..."
-                        st.write(details)
-                    with col3:
-                        st.write(f"{status_icon} {action['ExecutionStatus']}")
-                    with col4:
-                        st.write(action['ActionTimestamp'].strftime("%H:%M:%S"))
+                        # Show relative time
+                        time_diff = datetime.now() - action['timestamp']
+                        if time_diff.seconds < 60:
+                            st.write(f"{time_diff.seconds}s ago")
+                        elif time_diff.seconds < 3600:
+                            st.write(f"{time_diff.seconds//60}m ago")
+                        else:
+                            st.write(f"{time_diff.seconds//3600}h ago")
                     
                     st.divider()
         else:
-            st.info("No recent actions to display. Upload and process data to see live activity.")
+            st.info("No recent activity to display. The monitor will show activity here as it processes data.")
 
     # Action Log - Collapsible
     with st.expander("📝 Action Log", expanded=False):
-        # Get agent actions
-        agent_actions = db.get_agent_actions()
+        with st.spinner("📊 Loading action history..."):
+            # Get agent actions
+            agent_actions = db.get_agent_actions()
         
         if not agent_actions.empty:
             # Summary metrics
@@ -952,17 +1167,22 @@ if page == "📥 Upload & Process Data":
                     'AUTO_APPROVED': '🟢'
                 }.get(action['ExecutionStatus'], '⚫')
                 
-                with st.expander(f"{status_color} {action['AgentName']} - {action['ActionType']} ({action['ActionTimestamp']})", expanded=False):
-                    col1, col2 = st.columns(2)
+                with st.container():
+                    col1, col2, col3 = st.columns([3, 1, 2])
                     with col1:
-                        st.write(f"**Status:** {action['ExecutionStatus']}")
-                        st.write(f"**Human Approval:** {action['HumanApproval'] or 'N/A'}")
+                        st.write(f"{status_color} **{action['AgentName']}**: {action['ActionType']}")
                     with col2:
-                        st.write(f"**Timestamp:** {action['ActionTimestamp']}")
-                        st.write(f"**Agent:** {action['AgentName']}")
+                        st.write(f"**{action['ExecutionStatus']}**")
+                    with col3:
+                        st.write(f"**{action['ActionTimestamp'].strftime('%H:%M:%S')}**")
                     
-                    st.write("**Action Details:**")
-                    st.info(action['ActionDetails'])
+                    # Show details in a smaller text
+                    details = str(action['ActionDetails'])
+                    if len(details) > 100:
+                        details = details[:100] + "..."
+                    st.caption(f"Details: {details}")
+                    
+                    st.divider()
         else:
             st.info("No agent actions logged yet.")
 
@@ -979,7 +1199,8 @@ if page == "📥 Upload & Process Data":
             
             with col1:
                 # CSV Download
-                csv_data = healed_df.to_csv(index=False)
+                with st.spinner("📄 Preparing CSV file..."):
+                    csv_data = healed_df.to_csv(index=False)
                 st.download_button(
                     label="📄 Download as CSV",
                     data=csv_data,
@@ -991,9 +1212,10 @@ if page == "📥 Upload & Process Data":
             with col2:
                 # Excel Download
                 from io import BytesIO
-                buffer = BytesIO()
-                healed_df.to_excel(buffer, index=False, engine='openpyxl')
-                buffer.seek(0)
+                with st.spinner("📊 Preparing Excel file..."):
+                    buffer = BytesIO()
+                    healed_df.to_excel(buffer, index=False, engine='openpyxl')
+                    buffer.seek(0)
                 st.download_button(
                     label="📊 Download as Excel",
                     data=buffer,
@@ -1004,7 +1226,8 @@ if page == "📥 Upload & Process Data":
             
             with col3:
                 # JSON Download
-                json_data = healed_df.to_json(orient='records', indent=2)
+                with st.spinner("🔧 Preparing JSON file..."):
+                    json_data = healed_df.to_json(orient='records', indent=2)
                 st.download_button(
                     label="🔧 Download as JSON",
                     data=json_data,
@@ -1012,6 +1235,33 @@ if page == "📥 Upload & Process Data":
                     mime="application/json",
                     key="download_json"
                 )
+            
+            # Database Save Option
+            st.markdown("### 💾 Database Operations")
+            col_db1, col_db2 = st.columns(2)
+            
+            with col_db1:
+                if st.button("💾 Save to Database", key="save_to_db"):
+                    try:
+                        # Save healed data to database
+                        db_dataset_id = db.store_dataset(
+                            healed_df,
+                            f"HEALED_{dataset_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                            "HEALED",
+                            {
+                                "original_file": st.session_state.get('file_dataset_name', dataset_name),
+                                "healing_performed": True,
+                                "quality_report": st.session_state.processing_result.get('quality_report', {}),
+                                "validation_report": st.session_state.processing_result.get('validation_report', {})
+                            }
+                        )
+                        st.success(f"✅ Healed data saved to database! Dataset ID: {db_dataset_id}")
+                    except Exception as e:
+                        st.error(f"❌ Failed to save to database: {str(e)}")
+            
+            with col_db2:
+                if st.button("📊 View in Database Browser", key="view_in_db"):
+                    st.info("💡 Database browser feature coming soon! For now, use the 'Database Browser' page to explore saved datasets.")
             
             # Dataset Summary
             st.markdown("### 📊 Dataset Summary")
@@ -1021,7 +1271,12 @@ if page == "📥 Upload & Process Data":
             with col2:
                 st.metric("Total Columns", len(healed_df.columns))
             with col3:
-                quality_score = st.session_state.processing_result.get('quality_report', {}).get('quality_score', 0)
+                # Use final quality score if healing is completed, otherwise use original
+                quality_report = st.session_state.processing_result.get('quality_report', {})
+                if quality_report.get('healing_completed', False):
+                    quality_score = quality_report.get('final_quality_score', quality_report.get('quality_score', 0))
+                else:
+                    quality_score = quality_report.get('quality_score', 0)
                 st.metric("Quality Score", f"{quality_score:.1f}%")
             with col4:
                 issues_count = len(st.session_state.processing_result.get('quality_report', {}).get('issues', []))
@@ -1031,20 +1286,50 @@ if page == "📥 Upload & Process Data":
     st.markdown("---")
     with st.expander("🔄 Real-Time API Data Feed", expanded=False):
         st.markdown("**Connect to live APIs for continuous data ingestion:**")
+        st.markdown("💡 **Automatic fetching is active** - APIs will be fetched based on their configured intervals when the real-time monitor is running.")
+        
+        # Show monitor status
+        monitor_status = rt_monitor.get_status()
+        if monitor_status['running']:
+            st.success("🟢 Real-time monitor is running - automatic API fetching enabled")
+        else:
+            st.warning("🟡 Real-time monitor is stopped - APIs will only be fetched manually")
         
         # API Connection Setup
         col1, col2 = st.columns([2, 1])
         with col1:
+            # Initialize session state for demo APIs
+            if 'demo_api_url' not in st.session_state:
+                st.session_state.demo_api_url = ""
+            if 'demo_api_name' not in st.session_state:
+                st.session_state.demo_api_name = ""
+            
             api_url = st.text_input(
                 "API Endpoint URL",
+                value=st.session_state.demo_api_url,
                 placeholder="https://api.example.com/data",
                 help="Enter the API endpoint URL for data fetching"
             )
             api_name = st.text_input(
                 "API Source Name",
+                value=st.session_state.demo_api_name,
                 placeholder="e.g., Sales API, Weather API",
                 help="Give this API source a descriptive name"
             )
+            
+            # Demo API suggestions
+            st.markdown("**💡 Demo APIs to try:**")
+            demo_col1, demo_col2 = st.columns(2)
+            with demo_col1:
+                if st.button("🌤️ Weather API (Open-Meteo)"):
+                    st.session_state.demo_api_url = "https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.0060&hourly=temperature_2m,relative_humidity_2m,precipitation"
+                    st.session_state.demo_api_name = "NYC Weather API"
+                    st.rerun()
+            with demo_col2:
+                if st.button("📊 JSON Placeholder"):
+                    st.session_state.demo_api_url = "https://jsonplaceholder.typicode.com/posts"
+                    st.session_state.demo_api_name = "Demo Posts API"
+                    st.rerun()
         
         with col2:
             st.markdown("**Fetch Interval**")
@@ -1112,10 +1397,10 @@ if page == "📥 Upload & Process Data":
                                     st.success(f"✅ API '{api_name}' connected successfully! Fetched {len(data)} records.")
                                     
                                     # Show data preview
-                                    with st.expander("📊 Data Preview", expanded=True):
-                                        preview_df = pd.DataFrame(data[:5])  # Show first 5 records
-                                        st.dataframe(preview_df, use_container_width=True)
-                                        st.caption(f"Showing 5 of {len(data)} records")
+                                    st.markdown("#### 📊 Data Preview")
+                                    preview_df = pd.DataFrame(data[:5])  # Show first 5 records
+                                    st.dataframe(preview_df, use_container_width=True)
+                                    st.caption(f"Showing 5 of {len(data)} records")
                                 else:
                                     st.warning(f"⚠️ API connected but returned empty data.")
                             except Exception as e:
@@ -1130,87 +1415,449 @@ if page == "📥 Upload & Process Data":
         
         # Connected APIs List
         st.markdown("### 🔗 Connected API Sources")
+        
+        # Bulk actions
         try:
             api_sources = db.list_api_sources()
             if not api_sources.empty:
+                col_bulk, col_spacer = st.columns([1, 3])
+                with col_bulk:
+                    # Remove all API sources button with confirmation
+                    remove_all_key = "remove_all_confirm"
+                    if remove_all_key not in st.session_state:
+                        st.session_state[remove_all_key] = False
+                    
+                    if not st.session_state[remove_all_key]:
+                        if st.button("🗑️ Remove All Sources", help="Remove all connected API sources and their data"):
+                            st.session_state[remove_all_key] = True
+                            st.rerun()
+                    else:
+                        st.error("⚠️ Really remove ALL API sources? This will delete all fetch history and cannot be undone!")
+                        col_confirm_all, col_cancel_all = st.columns(2)
+                        with col_confirm_all:
+                            if st.button("✅ Yes, Remove All", key="confirm_remove_all", type="primary"):
+                                try:
+                                    removed_count = 0
+                                    for _, source in api_sources.iterrows():
+                                        if db.remove_api_source(source['ID']):
+                                            removed_count += 1
+                                            # Clear any cached data for this source
+                                            if f"api_preview_{source['ID']}" in st.session_state:
+                                                del st.session_state[f"api_preview_{source['ID']}"]
+                                    
+                                    if removed_count > 0:
+                                        st.success(f"✅ Removed {removed_count} API sources and all their data!")
+                                        st.session_state[remove_all_key] = False
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Failed to remove API sources")
+                                except Exception as e:
+                                    st.error(f"❌ Error removing API sources: {str(e)}")
+                        
+                        with col_cancel_all:
+                            if st.button("❌ Cancel", key="cancel_remove_all"):
+                                st.session_state[remove_all_key] = False
+                                st.rerun()
+                
+                st.markdown("---")
+            
+            if not api_sources.empty:
                 for _, source in api_sources.iterrows():
-                    with st.expander(f"🔗 {source['SourceName']} - {source['ApiUrl']}", expanded=False):
+                    # Use container instead of nested expander
+                    with st.container():
+                        st.markdown(f"**🔗 {source['SourceName']}**")
+                        st.caption(f"URL: {source['ApiUrl']}")
+                        
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.write(f"**Status:** {'🟢 Active' if source['IsActive'] else '🔴 Inactive'}")
+                            status_icon = "🟢" if source['IsActive'] else "🔴"
+                            st.write(f"**Status:** {status_icon} {'Active' if source['IsActive'] else 'Inactive'}")
                         with col2:
-                            st.write(f"**Interval:** {source['FetchInterval']//60} min")
+                            interval_min = source['FetchInterval'] // 60
+                            auto_fetch = "Auto-fetch enabled" if source['FetchInterval'] > 0 else "Manual fetch only"
+                            st.write(f"**Interval:** {interval_min} min ({auto_fetch})")
                         with col3:
                             last_fetch = source['LastFetchTimestamp']
                             if pd.notna(last_fetch):
-                                st.write(f"**Last Fetch:** {last_fetch.strftime('%H:%M:%S')}")
+                                time_since = (datetime.now() - last_fetch).total_seconds()
+                                if time_since < 60:
+                                    time_str = f"{int(time_since)}s ago"
+                                elif time_since < 3600:
+                                    time_str = f"{int(time_since//60)}m ago"
+                                else:
+                                    time_str = last_fetch.strftime('%H:%M:%S')
+                                st.write(f"**Last Fetch:** {time_str}")
                             else:
                                 st.write("**Last Fetch:** Never")
                         
-                        # Manual fetch button
-                        if st.button(f"🔄 Fetch Now", key=f"fetch_{source['ID']}"):
-                            try:
-                                # Use the improved fetch_and_store_api method that handles nested JSON
-                                result = db.fetch_and_store_api(
-                                    source_id=source['ID'],
-                                    url=source['ApiUrl'],
-                                    method='GET',
-                                    data_format='json',
-                                    timeout=20
-                                )
-                                
-                                # Result can be a DataFrame or raw JSON
-                                if isinstance(result, pd.DataFrame):
-                                    st.session_state[f"api_preview_{source['ID']}"] = result
-                                    st.success(f"✅ Data fetched successfully! ({len(result)} records)")
-                                    st.rerun()
-                                elif isinstance(result, dict) or isinstance(result, list):
-                                    # Try to convert to DataFrame
-                                    try:
-                                        df = pd.DataFrame(result) if isinstance(result, list) else pd.DataFrame([result])
-                                        st.session_state[f"api_preview_{source['ID']}"] = df
-                                        st.success(f"✅ Data fetched successfully! ({len(df)} records)")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"❌ Could not convert API response to table: {str(e)}")
+                        # Show next fetch time if active
+                        if source['IsActive'] and source['FetchInterval'] > 0 and pd.notna(last_fetch):
+                            next_fetch = last_fetch + timedelta(seconds=source['FetchInterval'])
+                            time_to_next = (next_fetch - datetime.now()).total_seconds()
+                            if time_to_next > 0:
+                                if time_to_next < 60:
+                                    next_str = f"{int(time_to_next)}s"
+                                elif time_to_next < 3600:
+                                    next_str = f"{int(time_to_next//60)}m"
                                 else:
-                                    st.error("❌ API returned unexpected data format")
-                            except Exception as e:
-                                st.error(f"❌ Fetch failed: {str(e)}")
+                                    next_str = next_fetch.strftime('%H:%M:%S')
+                                st.info(f"⏰ Next auto-fetch in: {next_str}")
                         
-                        # Show data preview if available
-                        if f"api_preview_{source['ID']}" in st.session_state:
-                            preview_df = st.session_state[f"api_preview_{source['ID']}"]
+                        # Action buttons
+                        col_fetch, col_remove = st.columns([1, 1])
+                        
+                        with col_fetch:
+                            # Manual fetch button
+                            if st.button(f"🔄 Fetch Now", key=f"fetch_{source['ID']}"):
+                                try:
+                                    # Use the improved fetch_and_store_api method that handles nested JSON
+                                    result = db.fetch_and_store_api(
+                                        source_id=source['ID'],
+                                        url=source['ApiUrl'],
+                                        method='GET',
+                                        data_format='json',
+                                        timeout=20
+                                    )
+                                    
+                                    # Result can be a DataFrame or raw JSON
+                                    if isinstance(result, pd.DataFrame):
+                                        st.session_state[f"api_preview_{source['ID']}"] = result
+                                        st.success(f"✅ Data fetched successfully! ({len(result)} records)")
+                                        st.rerun()
+                                    elif isinstance(result, dict) or isinstance(result, list):
+                                        # Try to convert to DataFrame
+                                        try:
+                                            df = pd.DataFrame(result) if isinstance(result, list) else pd.DataFrame([result])
+                                            st.session_state[f"api_preview_{source['ID']}"] = df
+                                            st.success(f"✅ Data fetched successfully! ({len(df)} records)")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"❌ Could not convert API response to table: {str(e)}")
+                                    else:
+                                        st.error("❌ API returned unexpected data format")
+                                except Exception as e:
+                                    st.error(f"❌ Fetch failed: {str(e)}")
+                        
+                        with col_remove:
+                            # Remove API source button with confirmation
+                            remove_key = f"remove_confirm_{source['ID']}"
+                            if remove_key not in st.session_state:
+                                st.session_state[remove_key] = False
                             
-                            with st.expander("📊 Fetched Data Preview", expanded=False):
-                                # Show first 5 records
-                                display_df = preview_df.head(5)
-                                st.dataframe(display_df, use_container_width=True)
-                                st.caption(f"Showing {len(display_df)} of {len(preview_df)} records")
-                            
-                            # Auto-heal button
-                            if st.button(f"🩺 Auto-Heal This Data", key=f"heal_api_{source['ID']}", type="primary"):
-                                with st.spinner("🩺 Analyzing and healing live API data..."):
-                                    try:
-                                        # Process the fetched data through the pipeline
-                                        processing_result, dataset_id = orchestrator.process_dataset(
-                                            preview_df, 
-                                            f"API_{source['SourceName']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                                        )
-                                        
-                                        st.session_state.processing_result = processing_result
-                                        st.session_state.current_dataset_id = dataset_id
-                                        st.session_state.current_df = preview_df
-                                        
-                                        st.success("✅ Live data analysis complete! Check 'Upload & Process Data' page for healing actions.")
-                                        st.info(f"Quality Score: {processing_result['quality_report']['quality_score']:.1f}/100")
-                                        
-                                    except Exception as e:
-                                        st.error(f"❌ Auto-heal failed: {str(e)}")
-            else:
-                st.info("No API sources connected yet. Connect your first API above!")
+                            if not st.session_state[remove_key]:
+                                if st.button(f"🗑️ Remove", key=f"remove_{source['ID']}", 
+                                           help=f"Remove {source['SourceName']} API source"):
+                                    st.session_state[remove_key] = True
+                                    st.rerun()
+                            else:
+                                st.warning(f"⚠️ Really remove '{source['SourceName']}'? This will delete all fetch history!")
+                                col_confirm, col_cancel = st.columns(2)
+                                with col_confirm:
+                                    if st.button("✅ Yes, Remove", key=f"confirm_remove_{source['ID']}", type="primary"):
+                                        try:
+                                            if db.remove_api_source(source['ID']):
+                                                st.success(f"✅ Removed API source '{source['SourceName']}' and all its data!")
+                                                # Clear any cached data for this source
+                                                if f"api_preview_{source['ID']}" in st.session_state:
+                                                    del st.session_state[f"api_preview_{source['ID']}"]
+                                                st.session_state[remove_key] = False
+                                                st.rerun()
+                                            else:
+                                                st.error("❌ Failed to remove API source")
+                                        except Exception as e:
+                                            st.error(f"❌ Error removing API source: {str(e)}")
+                                
+                                with col_cancel:
+                                    if st.button("❌ Cancel", key=f"cancel_remove_{source['ID']}"):
+                                        st.session_state[remove_key] = False
+                                        st.rerun()
+                        
+                        # Add separator between API sources
+                        st.markdown("---")
+        
         except Exception as e:
             st.error(f"Error loading API sources: {str(e)}")
+        
+        # API Data Healing Section
+        st.markdown("### 🩺 Heal Fetched API Data")
+        
+        # Check for any API preview data that can be healed
+        api_preview_keys = [key for key in st.session_state.keys() if key.startswith('api_preview_')]
+        
+        if api_preview_keys:
+            st.markdown("**Available API datasets for healing:**")
+            
+            for preview_key in api_preview_keys:
+                source_id = preview_key.replace('api_preview_', '')
+                api_df = st.session_state[preview_key]
+                
+                # Get source name
+                try:
+                    sources_df = db.list_api_sources()
+                    source_row = sources_df[sources_df['ID'] == int(source_id)]
+                    if not source_row.empty:
+                        source_name = source_row.iloc[0]['SourceName']
+                    else:
+                        source_name = f"API Source {source_id}"
+                except:
+                    source_name = f"API Source {source_id}"
+                
+                with st.expander(f"🩺 Heal: {source_name} ({len(api_df)} records)", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Records", len(api_df))
+                    with col2:
+                        st.metric("Columns", len(api_df.columns))
+                    with col3:
+                        st.metric("Missing Values", api_df.isnull().sum().sum())
+                    
+                    # Show preview
+                    st.dataframe(api_df.head(5), use_container_width=True)
+                    
+                    # Quality Analysis Section
+                    st.markdown("### 📊 Data Quality Assessment")
+                    
+                    # Analyze quality for display
+                    try:
+                        quality_report = quality_agent.analyze_dataset(api_df, f"API_{source_name}")
+                        quality_score = quality_report.get('quality_score', 0)
+                        
+                        # Quality score display
+                        col_q1, col_q2, col_q3 = st.columns(3)
+                        with col_q1:
+                            if quality_score >= 90:
+                                st.metric("Quality Score", f"{quality_score:.1f}%", "Excellent")
+                                st.success("🟢 High Quality Data")
+                            elif quality_score >= 70:
+                                st.metric("Quality Score", f"{quality_score:.1f}%", "Good")
+                                st.info("🟡 Moderate Quality")
+                            else:
+                                st.metric("Quality Score", f"{quality_score:.1f}%", "Needs Healing")
+                                st.warning("🔴 Low Quality Data")
+                        
+                        with col_q2:
+                            issues_count = len(quality_report.get('issues', []))
+                            st.metric("Issues Found", issues_count)
+                        
+                        with col_q3:
+                            if issues_count > 0:
+                                st.metric("Status", "Needs Attention")
+                            else:
+                                st.metric("Status", "Ready to Use")
+                        
+                        # Show top issues if any
+                        if issues_count > 0:
+                            st.markdown("**Top Issues Detected:**")
+                            issues_list = quality_report.get('issues', [])[:3]  # Show top 3
+                            for issue in issues_list:
+                                issue_type = issue.get('type', 'Unknown')
+                                severity = issue.get('severity', 'medium')
+                                description = issue.get('description', 'Data quality issue detected')
+                                
+                                if severity == 'high':
+                                    st.error(f"🔴 {issue_type}: {description}")
+                                elif severity == 'medium':
+                                    st.warning(f"🟡 {issue_type}: {description}")
+                                else:
+                                    st.info(f"ℹ️ {issue_type}: {description}")
+                    
+                    except Exception as e:
+                        st.error(f"❌ Quality analysis failed: {str(e)}")
+                        quality_score = 0
+                    
+                    # Healing button
+                    heal_key = f"heal_api_{source_id}"
+                    
+                    # Determine button text and type based on quality
+                    if 'quality_score' in locals() and quality_score >= 90:
+                        button_text = f"✨ Optimize This High-Quality API Data"
+                        button_type = "secondary"
+                    elif 'quality_score' in locals() and quality_score >= 70:
+                        button_text = f"🩺 Improve This API Data Quality"
+                        button_type = "primary"
+                    else:
+                        button_text = f"🩺 Auto-Heal This API Data (Quality: {quality_score:.1f}%)"
+                        button_type = "primary"
+                    
+                    if st.button(button_text, key=heal_key, type=button_type):
+                        # Create progress tracking
+                        progress_container = st.container()
+                        status_container = st.container()
+                        
+                        with progress_container:
+                            progress_bar = st.progress(0)
+                            progress_text = st.empty()
+                        
+                        with status_container:
+                            status_text = st.empty()
+                        
+                        try:
+                            # Step 1: Dataset Storage (10%)
+                            progress_text.text("📦 Storing API dataset...")
+                            progress_bar.progress(10)
+                            status_text.info("🔄 Step 1/6: Dataset Storage - Saving API data securely...")
+                            
+                            # Clean the DataFrame to ensure it can be serialized to JSON
+                            # Remove columns that contain complex objects (dicts, lists)
+                            cleaned_df = api_df.copy()
+                            for col in cleaned_df.columns:
+                                if cleaned_df[col].dtype == 'object':
+                                    # Check if any values in this column are dicts or lists
+                                    sample_values = cleaned_df[col].dropna().head(3)
+                                    if any(isinstance(val, (dict, list)) for val in sample_values):
+                                        # Convert complex objects to strings
+                                        cleaned_df[col] = cleaned_df[col].astype(str)
+                            
+                            # Store in database with API source context
+                            dataset_id = db.store_dataset(
+                                f"API_{source_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                cleaned_df
+                            )
+                            
+                            # Step 2: Quality Analysis (30%)
+                            progress_text.text("🔍 Analyzing API data quality...")
+                            progress_bar.progress(30)
+                            status_text.info("🔄 Step 2/6: Quality Analysis - Scanning for issues...")
+                            
+                            quality_report = quality_agent.analyze_dataset(api_df, f"API_{source_name}")
+                            
+                            # Step 3: Healing Plan Generation (50%)
+                            progress_text.text("🧠 Generating healing plan...")
+                            progress_bar.progress(50)
+                            status_text.info("🔄 Step 3/6: AI Planning - Creating healing strategies...")
+                            
+                            healing_plan = healing_agent.propose_healing_actions(api_df, quality_report)
+                            
+                            # Step 4: Auto-Execution (70%)
+                            progress_text.text("🔧 Auto-executing healing actions...")
+                            progress_bar.progress(70)
+                            status_text.info("🔄 Step 4/6: Auto-Healing - Applying fixes automatically...")
+                            
+                            # Choose processing method based on dataset size
+                            if len(api_df) > 100000:  # Use chunked processing for large datasets
+                                status_text.info(f"🔄 Step 4/6: Large Dataset Processing - Using chunked healing for {len(api_df)} rows...")
+                                healed_df, healing_summary = healing_agent.execute_healing_actions_chunked(
+                                    api_df, healing_plan, chunk_size=50000
+                                )
+                                st.info(f"📊 Processed in {healing_summary.get('total_chunks', 1)} chunks, {healing_summary.get('total_records_affected', 0)} records affected")
+                            else:
+                                # Execute all healing actions from the plan
+                                healed_df = api_df.copy()
+                                for action in healing_plan.get('actions', []):
+                                    method = action.get('recommended_method', action.get('method', 'DELETE_ROWS'))
+                                    healed_df, exec_log = healing_agent.execute_healing_action(healed_df, action, method)
+                            
+                            # Step 5: Validation (90%)
+                            progress_text.text("✅ Validating healed data...")
+                            progress_bar.progress(90)
+                            status_text.info("🔄 Step 5/6: Validation - Ensuring data quality...")
+                            
+                            # Create validation report by comparing before/after quality
+                            final_quality_report = quality_agent.analyze_dataset(healed_df, f"HEALED_API_{source_name}")
+                            
+                            validation_report = {
+                                'original_quality_score': quality_report.get('quality_score', 0),
+                                'final_quality_score': final_quality_report.get('quality_score', 0),
+                                'quality_improvement': final_quality_report.get('quality_score', 0) - quality_report.get('quality_score', 0),
+                                'original_issues_count': len(quality_report.get('issues', [])),
+                                'final_issues_count': len(final_quality_report.get('issues', [])),
+                                'issues_resolved': len(quality_report.get('issues', [])) - len(final_quality_report.get('issues', [])),
+                                'validation_timestamp': datetime.now().isoformat(),
+                                'healing_actions_executed': len(healing_plan.get('actions', [])),
+                                'validation_status': 'PASSED' if final_quality_report.get('quality_score', 0) >= quality_report.get('quality_score', 0) else 'IMPROVEMENT_NEEDED'
+                            }
+                            
+                            # Step 6: Final Storage (100%)
+                            progress_text.text("💾 Finalizing results...")
+                            progress_bar.progress(100)
+                            status_text.success("✅ Step 6/6: Complete - API data healed successfully!")
+                            
+                            # Store healed result
+                            st.session_state[f'api_healed_{source_id}'] = healed_df
+                            st.session_state[f'api_validation_{source_id}'] = validation_report
+                            st.session_state[f'api_quality_{source_id}'] = quality_report
+                            
+                            st.success(f"🎉 API data '{source_name}' healed successfully!")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"❌ Healing failed: {str(e)}")
+                            progress_bar.progress(100)
+                            progress_text.text("❌ Healing failed")
+                    
+                    # Show healed results if available
+                    healed_key = f'api_healed_{source_id}'
+                    if healed_key in st.session_state:
+                        st.success("✅ **Data Healed Successfully!**")
+                        
+                        healed_df = st.session_state[healed_key]
+                        validation_report = st.session_state.get(f'api_validation_{source_id}', {})
+                        
+                        # Show before/after comparison
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**📊 Before Healing:**")
+                            st.metric("Missing Values", api_df.isnull().sum().sum())
+                            st.metric("Duplicates", api_df.duplicated().sum())
+                        
+                        with col2:
+                            st.markdown("**✨ After Healing:**")
+                            st.metric("Missing Values", healed_df.isnull().sum().sum())
+                            st.metric("Duplicates", healed_df.duplicated().sum())
+                        
+                        # Show healed data preview
+                        st.markdown("**🔎 Healed Data Preview:**")
+                        st.dataframe(healed_df.head(10), use_container_width=True)
+                        
+                        # Download and Database options
+                        st.markdown("### 💾 Export Healed API Data")
+                        col_dl1, col_dl2, col_dl3 = st.columns(3)
+                        
+                        with col_dl1:
+                            # CSV Download
+                            csv_data = healed_df.to_csv(index=False)
+                            st.download_button(
+                                label="📄 Download CSV",
+                                data=csv_data,
+                                file_name=f"{source_name}_healed.csv",
+                                mime="text/csv",
+                                key=f"api_download_csv_{source_id}"
+                            )
+                        
+                        with col_dl2:
+                            # Excel Download
+                            excel_buffer = io.BytesIO()
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                healed_df.to_excel(writer, sheet_name='Healed_Data', index=False)
+                                # Add validation sheet
+                                if validation_report:
+                                    pd.DataFrame([validation_report]).to_excel(writer, sheet_name='Validation_Report', index=False)
+                            excel_data = excel_buffer.getvalue()
+                            
+                            st.download_button(
+                                label="📊 Download Excel",
+                                data=excel_data,
+                                file_name=f"{source_name}_healed.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"api_download_excel_{source_id}"
+                            )
+                        
+                        with col_dl3:
+                            # Send to Database
+                            if st.button("💾 Send to Database", key=f"api_to_db_{source_id}"):
+                                try:
+                                    # Store healed data in database
+                                    db_dataset_id = db.store_dataset(
+                                        f"HEALED_API_{source_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                        healed_df,
+                                        None,
+                                        validation_report.get('final_quality_score', 0)
+                                    )
+                                    st.success(f"✅ Healed data saved to database! Dataset ID: {db_dataset_id}")
+                                except Exception as e:
+                                    st.error(f"❌ Failed to save to database: {str(e)}")
+        else:
+            st.info("💡 No API data available for healing. Fetch data from an API source above to see healing options.")
 
 elif page == "⚙️ Settings & Health":
     st.title("⚙️ Settings & Health")

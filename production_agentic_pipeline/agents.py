@@ -2,6 +2,7 @@ import requests
 import json
 import pandas as pd
 import numpy as np
+import logging
 from datetime import datetime
 from config import Config
 from database import ProductionDatabase
@@ -12,6 +13,8 @@ class ProductionAIAgent:
         self.name = name
         self.role = role
         self.db = ProductionDatabase()
+        self.logger = logging.getLogger(f"{self.__class__.__name__}.{name}")
+        self.logger.setLevel(logging.INFO)
         
     def call_groq_api(self, prompt, temperature=0.1):
         """Production-ready API call with error handling and fallback"""
@@ -141,7 +144,233 @@ class DataQualityAgent(ProductionAIAgent):
         self.learning_system = AgentLearningSystem(self.db)
         print("DataQualityAgent initialized with learning system")
     
+    def analyze_dataset_optimized(self, df, dataset_name, sample_size=50000, max_problematic_rows=10000):
+        """Optimized dataset analysis for large datasets - only analyzes problematic rows"""
+
+        # Determine if we need sampling
+        use_sampling = len(df) > sample_size
+        analysis_sample_size = min(sample_size, len(df))
+
+        # Initialize quality report
+        quality_report = {
+            'dataset_name': dataset_name,
+            'total_records': len(df),
+            'total_columns': len(df.columns),
+            'issues': [],
+            'quality_score': 0,
+            'recommendations': [],
+            'analysis_method': 'selective_rows',
+            'sampled_records': analysis_sample_size if use_sampling else len(df),
+            'problematic_rows_analyzed': 0
+        }
+
+        try:
+            # Step 1: Identify problematic rows efficiently
+            problematic_indices = self._identify_problematic_rows(df, max_problematic_rows)
+
+            quality_report['problematic_rows_identified'] = len(problematic_indices)
+
+            # Step 2: Analyze only problematic rows (or sample if too many)
+            if len(problematic_indices) > 0:
+                # Limit analysis to prevent memory issues
+                analysis_indices = problematic_indices[:max_problematic_rows]
+                problematic_df = df.iloc[analysis_indices]
+
+                quality_report['problematic_rows_analyzed'] = len(analysis_indices)
+
+                # Analyze null values in problematic rows only
+                null_analysis = problematic_df.isnull().sum()
+                for col, null_count in null_analysis.items():
+                    if null_count > 0:
+                        # Calculate percentage based on total dataset, not just problematic rows
+                        total_nulls_in_col = df[col].isnull().sum()
+                        null_percentage = (total_nulls_in_col / len(df)) * 100
+
+                        severity = ("HIGH" if null_percentage > 15
+                                  else "MEDIUM" if null_percentage > 5
+                                  else "LOW")
+
+                        quality_report['issues'].append({
+                            'type': 'NULL_VALUES',
+                            'column': col,
+                            'affected_rows': int(total_nulls_in_col),
+                            'percentage': round(null_percentage, 2),
+                            'severity': severity,
+                            'analysis_method': 'selective_rows'
+                        })
+
+            # Step 3: Check for duplicates (efficient sampling approach)
+            if use_sampling:
+                # Sample for duplicate detection to avoid full scan
+                sample_df = df.sample(n=analysis_sample_size, random_state=42)
+                sample_duplicates = sample_df.duplicated().sum()
+                if sample_duplicates > 0:
+                    # Estimate total duplicates
+                    estimated_duplicates = int((sample_duplicates / analysis_sample_size) * len(df))
+                    duplicate_percentage = (estimated_duplicates / len(df)) * 100
+
+                    severity = ("HIGH" if duplicate_percentage > 10
+                              else "MEDIUM" if duplicate_percentage > 2
+                              else "LOW")
+
+                    quality_report['issues'].append({
+                        'type': 'DUPLICATES_ESTIMATED',
+                        'affected_rows': estimated_duplicates,
+                        'percentage': round(duplicate_percentage, 2),
+                        'severity': severity,
+                        'analysis_method': 'sampled_estimation'
+                    })
+            else:
+                # Full scan for smaller datasets
+                duplicate_count = df.duplicated().sum()
+                if duplicate_count > 0:
+                    duplicate_percentage = (duplicate_count / len(df)) * 100
+                    severity = ("HIGH" if duplicate_percentage > 10
+                              else "MEDIUM" if duplicate_percentage > 2
+                              else "LOW")
+
+                    quality_report['issues'].append({
+                        'type': 'DUPLICATES',
+                        'affected_rows': int(duplicate_count),
+                        'percentage': round(duplicate_percentage, 2),
+                        'severity': severity,
+                        'analysis_method': 'full_scan'
+                    })
+
+            # Step 4: Check for outliers in numeric columns (efficient approach)
+            numeric_columns = df.select_dtypes(include=[np.number]).columns
+            for col in numeric_columns:
+                if use_sampling:
+                    # Use statistical bounds instead of full z-score calculation
+                    sample_values = df[col].dropna().sample(n=min(analysis_sample_size, len(df[col].dropna())), random_state=42)
+                    if len(sample_values) > 0:
+                        Q1 = sample_values.quantile(0.25)
+                        Q3 = sample_values.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+
+                        # Estimate outliers in full dataset
+                        estimated_outliers = ((df[col] < lower_bound) | (df[col] > upper_bound)).sum()
+                        outlier_percentage = (estimated_outliers / len(df)) * 100
+
+                        if estimated_outliers > 0:
+                            severity = ("HIGH" if outlier_percentage > 10
+                                      else "MEDIUM" if outlier_percentage > 3
+                                      else "LOW")
+
+                            quality_report['issues'].append({
+                                'type': 'OUTLIERS_ESTIMATED',
+                                'column': col,
+                                'affected_rows': int(estimated_outliers),
+                                'percentage': round(outlier_percentage, 2),
+                                'severity': severity,
+                                'analysis_method': 'statistical_estimation'
+                            })
+                else:
+                    # Full analysis for smaller datasets
+                    if not df[col].empty:
+                        z_scores = np.abs((df[col] - df[col].mean()) / df[col].std())
+                        outliers = (z_scores > Config.QUALITY_RULES['outlier_std_threshold']).sum()
+                        if outliers > 0:
+                            outlier_percentage = (outliers / len(df)) * 100
+                            severity = ("HIGH" if outlier_percentage > 10
+                                      else "MEDIUM" if outlier_percentage > 3
+                                      else "LOW")
+
+                            quality_report['issues'].append({
+                                'type': 'OUTLIERS',
+                                'column': col,
+                                'affected_rows': int(outliers),
+                                'percentage': round(outlier_percentage, 2),
+                                'severity': severity,
+                                'analysis_method': 'full_scan'
+                            })
+
+            # Step 5: Calculate quality score
+            total_issues = sum(issue['affected_rows'] for issue in quality_report['issues'])
+            quality_report['quality_score'] = max(0, 100 - (total_issues / len(df)) * 100)
+
+            # Step 6: Generate recommendations
+            if quality_report['issues']:
+                quality_report['recommendations'] = self._generate_optimized_recommendations(quality_report, len(df))
+
+            return quality_report
+
+        except Exception as e:
+            self.logger.error(f"Error in optimized dataset analysis: {str(e)}")
+            # Fallback to basic analysis
+            return self.analyze_dataset_basic(df, dataset_name)
+
     def analyze_dataset(self, df, dataset_name):
+        """Main dataset analysis method - automatically chooses optimized or basic analysis"""
+        # Use optimized analysis for large datasets (>100k rows) or datasets with many columns
+        if len(df) > 100000 or len(df.columns) > 50:
+            return self.analyze_dataset_optimized(df, dataset_name)
+        else:
+            return self.analyze_dataset_basic(df, dataset_name)
+
+    def _identify_problematic_rows(self, df, max_rows=10000):
+        """Efficiently identify rows that need detailed analysis"""
+        problematic_indices = set()
+
+        # Find rows with any null values
+        null_rows = df[df.isnull().any(axis=1)].index
+        problematic_indices.update(null_rows[:max_rows])  # Limit to prevent memory issues
+
+        # Find duplicate rows (limit to prevent full scan)
+        if len(df) > 100000:
+            # For very large datasets, sample for duplicates
+            sample_size = min(50000, len(df))
+            sample_indices = df.sample(n=sample_size, random_state=42).index
+            sample_duplicates = df.loc[sample_indices][df.loc[sample_indices].duplicated()].index
+            problematic_indices.update(sample_duplicates[:max_rows//2])
+        else:
+            duplicate_rows = df[df.duplicated()].index
+            problematic_indices.update(duplicate_rows[:max_rows//2])
+
+        # Find rows with outlier values in numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if len(df[col].dropna()) > 1000:  # Only check if enough data
+                try:
+                    # Use IQR method for efficiency
+                    Q1 = df[col].quantile(0.25)
+                    Q3 = df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+
+                    outlier_rows = df[(df[col] < lower_bound) | (df[col] > upper_bound)].index
+                    problematic_indices.update(outlier_rows[:max_rows//4])  # Limit per column
+                except:
+                    continue  # Skip if calculation fails
+
+        return list(problematic_indices)[:max_rows]  # Final limit
+
+    def _generate_optimized_recommendations(self, quality_report, total_rows):
+        """Generate recommendations based on optimized analysis"""
+        recommendations = []
+
+        for issue in quality_report['issues']:
+            if issue['type'] == 'NULL_VALUES':
+                if issue['severity'] == 'HIGH':
+                    recommendations.append(f"Critical: Fill or remove {issue['affected_rows']} null values in {issue['column']} ({issue['percentage']}%)")
+                else:
+                    recommendations.append(f"Consider filling {issue['affected_rows']} null values in {issue['column']}")
+
+            elif 'DUPLICATES' in issue['type']:
+                if issue['severity'] == 'HIGH':
+                    recommendations.append(f"Critical: Remove {issue['affected_rows']} duplicate rows ({issue['percentage']}%)")
+                else:
+                    recommendations.append(f"Review {issue['affected_rows']} potential duplicate rows")
+
+            elif 'OUTLIERS' in issue['type']:
+                recommendations.append(f"Review {issue['affected_rows']} outlier values in {issue['column']} ({issue['percentage']}%)")
+
+        return recommendations
+
+    def analyze_dataset_basic(self, df, dataset_name):
         """Comprehensive data quality analysis with learning integration"""
         start_time = datetime.now()
         
@@ -320,8 +549,145 @@ class DataHealingAgent(ProductionAIAgent):
         self.learning_system = AgentLearningSystem(self.db)
         print("DataHealingAgent initialized with learning system")
     
+    def calculate_action_confidence(self, df, action, method, learning_insights):
+        """Calculate confidence score for a healing action (0.0 - 1.0)"""
+        confidence_factors = []
+        
+        # Factor 1: Data characteristics (40% weight)
+        if action['type'] == 'HANDLE_NULLS':
+            null_percentage = (action['affected_rows'] / len(df)) * 100
+            
+            # Low null % = higher confidence
+            if null_percentage < 5:
+                confidence_factors.append(0.95)  # Very confident for small % nulls
+            elif null_percentage < 15:
+                confidence_factors.append(0.80)
+            elif null_percentage < 30:
+                confidence_factors.append(0.60)
+            else:
+                confidence_factors.append(0.40)  # Low confidence for high % nulls
+            
+            # Numeric columns with mean/median are safer
+            col_data = df[action['column']]
+            if col_data.dtype in ['int64', 'float64'] and method in ['FILL_MEAN', 'FILL_MEDIAN']:
+                confidence_factors.append(0.85)
+            elif method == 'DELETE_ROWS' and null_percentage > 20:
+                confidence_factors.append(0.50)  # Risky to delete many rows
+            else:
+                confidence_factors.append(0.70)
+                
+        elif action['type'] == 'REMOVE_DUPLICATES':
+            dup_percentage = (action['affected_rows'] / len(df)) * 100
+            
+            # Removing duplicates is generally safe
+            if dup_percentage < 10:
+                confidence_factors.append(0.95)
+            elif dup_percentage < 30:
+                confidence_factors.append(0.75)
+            else:
+                confidence_factors.append(0.60)  # Many dupes might indicate data issue
+                
+        elif action['type'] == 'HANDLE_OUTLIERS':
+            # Outlier handling is riskier
+            if method == 'CAP_OUTLIERS':
+                confidence_factors.append(0.75)
+            elif method == 'REMOVE_OUTLIERS':
+                confidence_factors.append(0.65)  # More risky
+            else:
+                confidence_factors.append(0.70)
+        
+        # Factor 2: Learning from past (30% weight)
+        learned_confidence = learning_insights.get('overall_confidence', 0.5)
+        preferred_methods = learning_insights.get('preferred_methods', {})
+        
+        # Boost confidence if method matches learned preferences
+        if method in preferred_methods:
+            learned_confidence = min(1.0, learned_confidence + 0.15)
+        
+        confidence_factors.append(learned_confidence)
+        
+        # Factor 3: Severity-based confidence (30% weight)
+        severity_confidence = {
+            'LOW': 0.90,     # Low severity = safe to auto-execute
+            'MEDIUM': 0.70,  # Medium = might need approval
+            'HIGH': 0.50     # High = definitely need human review
+        }
+        confidence_factors.append(severity_confidence.get(action.get('severity', 'MEDIUM'), 0.70))
+        
+        # Calculate weighted average
+        final_confidence = sum(confidence_factors) / len(confidence_factors)
+        
+        return round(final_confidence, 2)
+    
+    def generate_action_reasoning(self, df, action, method, confidence):
+        """Generate chain-of-thought reasoning for action"""
+        reasoning = {
+            'decision': method,
+            'confidence': confidence,
+            'thought_process': [],
+            'alternatives': [],
+            'risks': []
+        }
+        
+        # Thought process
+        if action['type'] == 'HANDLE_NULLS':
+            col_data = df[action['column']]
+            null_pct = (action['affected_rows'] / len(df)) * 100
+            
+            reasoning['thought_process'].append(
+                f"Column '{action['column']}' has {null_pct:.1f}% null values ({action['affected_rows']} rows)"
+            )
+            
+            if col_data.dtype in ['int64', 'float64']:
+                mean_val = col_data.mean()
+                median_val = col_data.median()
+                reasoning['thought_process'].append(
+                    f"Column is numeric: mean={mean_val:.2f}, median={median_val:.2f}"
+                )
+                
+                if abs(mean_val - median_val) < (col_data.std() * 0.1):
+                    reasoning['thought_process'].append(
+                        "Mean and median are similar → distribution appears normal"
+                    )
+                else:
+                    reasoning['thought_process'].append(
+                        "Mean differs from median → distribution may be skewed, prefer median"
+                    )
+            
+            if null_pct < 5:
+                reasoning['thought_process'].append(
+                    "Low null percentage → filling is safe and preserves data"
+                )
+            elif null_pct > 30:
+                reasoning['thought_process'].append(
+                    "High null percentage → consider if column is useful or if deletion is better"
+                )
+            
+            # Alternatives
+            if method == 'FILL_MEDIAN':
+                reasoning['alternatives'] = ['FILL_MEAN (if distribution is normal)', 'DELETE_ROWS (if nulls are non-random)']
+            
+            # Risks
+            if null_pct > 20:
+                reasoning['risks'].append(f"Imputing {null_pct:.1f}% of data may introduce bias")
+            if method == 'DELETE_ROWS':
+                reasoning['risks'].append(f"Will lose {action['affected_rows']} records")
+                
+        elif action['type'] == 'REMOVE_DUPLICATES':
+            dup_pct = (action['affected_rows'] / len(df)) * 100
+            reasoning['thought_process'].append(
+                f"Found {action['affected_rows']} duplicate rows ({dup_pct:.1f}% of dataset)"
+            )
+            reasoning['thought_process'].append(
+                "Duplicates reduce data quality and may skew analysis"
+            )
+            reasoning['alternatives'] = ['KEEP_LAST (if newer records preferred)', 'Manual review (if duplicates seem intentional)']
+            reasoning['risks'] = ['May remove legitimate repeated measurements'] if dup_pct > 20 else []
+            
+        return reasoning
+    
     def propose_healing_actions(self, df, quality_report):
-        """Propose specific healing actions with learning integration"""
+        """Propose specific healing actions with confidence scoring and reasoning"""
         
         # Get learning insights for healing decisions
         learning_insights = self.learning_system.get_agent_recommendations(
@@ -335,7 +701,9 @@ class DataHealingAgent(ProductionAIAgent):
             'execution_order': [],
             'learning_applied': True,
             'learned_preferences': learning_insights.get('preferred_methods', {}),
-            'learning_confidence': learning_insights.get('overall_confidence', 0.5)
+            'learning_confidence': learning_insights.get('overall_confidence', 0.5),
+            'auto_executed_actions': [],  # Track auto-executed actions
+            'pending_approval_actions': []  # Track actions needing approval
         }
         
         for issue in quality_report['issues']:
@@ -351,33 +719,52 @@ class DataHealingAgent(ProductionAIAgent):
                 # Determine best null handling strategy
                 col_data = df[issue['column']]
                 if col_data.dtype in ['int64', 'float64']:
+                    # Choose median for numeric (generally safer)
+                    recommended_method = 'FILL_MEDIAN'
                     action['options'] = [
                         {'method': 'FILL_MEAN', 'description': f"Fill with mean value ({col_data.mean():.2f})"},
                         {'method': 'FILL_MEDIAN', 'description': f"Fill with median value ({col_data.median():.2f})"},
                         {'method': 'DELETE_ROWS', 'description': f"Delete {issue['affected_rows']} rows with null values"}
                     ]
                 else:
+                    # Choose mode/default for categorical
+                    recommended_method = 'FILL_MODE'
                     action['options'] = [
                         {'method': 'FILL_MODE', 'description': f"Fill with most common value"},
                         {'method': 'FILL_DEFAULT', 'description': f"Fill with default value 'Unknown'"},
                         {'method': 'DELETE_ROWS', 'description': f"Delete {issue['affected_rows']} rows with null values"}
                     ]
                 
+                # Calculate confidence and reasoning
+                action['recommended_method'] = recommended_method
+                action['confidence'] = self.calculate_action_confidence(df, action, recommended_method, learning_insights)
+                action['reasoning'] = self.generate_action_reasoning(df, action, recommended_method, action['confidence'])
+                action['risk_level'] = self._determine_risk_level(action['confidence'], issue['severity'])
+                
                 healing_plan['actions'].append(action)
             
             elif issue['type'] == 'DUPLICATES' and issue['severity'] in ['HIGH', 'MEDIUM', 'LOW']:
-                healing_plan['actions'].append({
+                recommended_method = 'KEEP_FIRST'
+                action = {
                     'type': 'REMOVE_DUPLICATES',
                     'affected_rows': issue['affected_rows'],
                     'severity': issue['severity'],
                     'options': [
                         {'method': 'KEEP_FIRST', 'description': 'Keep first occurrence of duplicates'},
                         {'method': 'KEEP_LAST', 'description': 'Keep last occurrence of duplicates'}
-                    ]
-                })
+                    ],
+                    'recommended_method': recommended_method
+                }
+                
+                action['confidence'] = self.calculate_action_confidence(df, action, recommended_method, learning_insights)
+                action['reasoning'] = self.generate_action_reasoning(df, action, recommended_method, action['confidence'])
+                action['risk_level'] = self._determine_risk_level(action['confidence'], issue['severity'])
+                
+                healing_plan['actions'].append(action)
             
             elif issue['type'] == 'OUTLIERS' and issue['severity'] in ['HIGH', 'MEDIUM']:
-                healing_plan['actions'].append({
+                recommended_method = 'CAP_OUTLIERS'
+                action = {
                     'type': 'HANDLE_OUTLIERS',
                     'column': issue['column'],
                     'affected_rows': issue['affected_rows'],
@@ -386,8 +773,15 @@ class DataHealingAgent(ProductionAIAgent):
                         {'method': 'CAP_OUTLIERS', 'description': 'Cap outliers to 95th percentile'},
                         {'method': 'REMOVE_OUTLIERS', 'description': 'Remove outlier records'},
                         {'method': 'LOG_TRANSFORM', 'description': 'Apply log transformation'}
-                    ]
-                })
+                    ],
+                    'recommended_method': recommended_method
+                }
+                
+                action['confidence'] = self.calculate_action_confidence(df, action, recommended_method, learning_insights)
+                action['reasoning'] = self.generate_action_reasoning(df, action, recommended_method, action['confidence'])
+                action['risk_level'] = self._determine_risk_level(action['confidence'], issue['severity'])
+                
+                healing_plan['actions'].append(action)
         
         # Get AI recommendations for execution order
         if healing_plan['actions']:
@@ -409,7 +803,51 @@ class DataHealingAgent(ProductionAIAgent):
             ai_order = self.call_groq_api(ai_prompt)
             healing_plan['ai_execution_plan'] = ai_order
         
+        # Categorize actions by confidence for auto-execution
+        for action in healing_plan['actions']:
+            confidence = action.get('confidence', 0.0)
+            risk_level = action.get('risk_level', 'MEDIUM')
+            
+            # AUTO-EXECUTE: High confidence (>90%) AND Low risk
+            if confidence >= 0.90 and risk_level == 'LOW':
+                healing_plan['auto_executed_actions'].append(action)
+            else:
+                # REQUIRE APPROVAL: Everything else
+                healing_plan['pending_approval_actions'].append(action)
+        
+        # Get AI recommendations for execution order (for pending actions)
+        if healing_plan['pending_approval_actions']:
+            ai_prompt = f"""
+            As a data healing specialist, recommend the optimal execution order for these data cleaning actions:
+            
+            Actions to perform: {json.dumps([a['type'] for a in healing_plan['pending_approval_actions']], indent=2)}
+            
+            Consider:
+            1. Which actions should be performed first to minimize data loss
+            2. Dependencies between actions
+            3. Impact on data integrity
+            
+            Respond with:
+            EXECUTION_ORDER: [comma-separated list of action types in order]
+            REASONING: [brief explanation of the order]
+            """
+            
+            ai_order = self.call_groq_api(ai_prompt)
+            healing_plan['ai_execution_plan'] = ai_order
+        
         return healing_plan
+    
+    def _determine_risk_level(self, confidence, severity):
+        """Determine risk level based on confidence and severity"""
+        # High confidence + Low severity = LOW risk
+        # Low confidence or High severity = HIGH risk
+        
+        if confidence >= 0.90 and severity == 'LOW':
+            return 'LOW'
+        elif confidence >= 0.75 and severity in ['LOW', 'MEDIUM']:
+            return 'MEDIUM'
+        else:
+            return 'HIGH'
     
     def execute_healing_action(self, df, action, method):
         """Execute a specific healing action"""
@@ -462,6 +900,87 @@ class DataHealingAgent(ProductionAIAgent):
             execution_log['message'] = f"Execution failed: {str(e)}"
         
         return cleaned_df, execution_log
+
+    def execute_healing_actions(self, df, healing_plan):
+        """Execute multiple healing actions on a dataset"""
+        current_df = df.copy()
+        execution_logs = []
+        total_records_affected = 0
+
+        for action in healing_plan.get('actions', []):
+            method = action.get('recommended_method', action.get('method'))
+            if method:
+                healed_df, exec_log = self.execute_healing_action(current_df, action, method)
+                current_df = healed_df
+                execution_logs.append(exec_log)
+                total_records_affected += exec_log.get('records_affected', 0)
+
+        healing_summary = {
+            'total_actions_executed': len(execution_logs),
+            'total_records_affected': total_records_affected,
+            'final_shape': current_df.shape,
+            'execution_logs': execution_logs,
+            'processing_method': 'standard'
+        }
+
+        return current_df, healing_summary
+
+    def execute_healing_actions_chunked(self, df, healing_plan, chunk_size=50000):
+        """Execute healing actions in chunks for large datasets"""
+        if len(df) <= chunk_size:
+            # For smaller datasets, use regular processing
+            return self.execute_healing_actions(df, healing_plan)
+
+        self.logger.info(f"Processing large dataset ({len(df)} rows) in chunks of {chunk_size}")
+
+        healed_chunks = []
+        total_processed = 0
+        total_affected = 0
+
+        # Process in chunks
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i+chunk_size].copy()
+            chunk_start = i
+            chunk_end = min(i + chunk_size, len(df))
+
+            self.logger.info(f"Processing chunk {i//chunk_size + 1}: rows {chunk_start}-{chunk_end}")
+
+            # Execute healing actions on this chunk
+            healed_chunk, chunk_log = self.execute_healing_actions(chunk, healing_plan)
+
+            healed_chunks.append(healed_chunk)
+            total_processed += len(chunk)
+            total_affected += chunk_log.get('total_records_affected', 0)
+
+            # Log progress (optional - only if dataset_id available)
+            # self.db.log_agent_action(
+            #     dataset_id, self.name,
+            #     "CHUNK_HEALING_PROGRESS",
+            #     f"Processing chunk {i//chunk_size + 1}: rows {chunk_start}-{chunk_end}",
+            #     "EXECUTING"
+            # )
+
+        # Combine all chunks
+        final_df = pd.concat(healed_chunks, ignore_index=True)
+
+        # Final summary log
+        healing_summary = {
+            'total_chunks': len(healed_chunks),
+            'total_processed': total_processed,
+            'total_records_affected': total_affected,
+            'final_shape': final_df.shape,
+            'processing_method': 'chunked'
+        }
+
+        # Final summary log (optional)
+        # self.db.log_agent_action(
+        #     dataset_id, self.name,
+        #     "CHUNKED_HEALING_COMPLETE",
+        #     f"Processed {len(healed_chunks)} chunks, {total_processed} total records, {total_affected} affected",
+        #     "COMPLETED"
+        # )
+
+        return final_df, healing_summary
     
     def recalculate_quality_score(self, df):
         """Recalculate quality score after healing"""
@@ -577,12 +1096,64 @@ class PipelineOrchestratorAgent(ProductionAIAgent):
                 "COMPLETED"
             )
             
-            # Log each proposed healing action
-            for i, action in enumerate(healing_plan['actions']):
+            # ========== AUTO-EXECUTE HIGH-CONFIDENCE ACTIONS ==========
+            auto_executed_results = []
+            current_df = df.copy()
+            
+            if healing_plan.get('auto_executed_actions'):
+                auto_exec_log_id = self.db.log_agent_action(
+                    dataset_id, self.healing_agent.name,
+                    "AUTO_EXECUTION_START",
+                    f"Auto-executing {len(healing_plan['auto_executed_actions'])} high-confidence actions",
+                    "EXECUTING"
+                )
+                
+                for action in healing_plan['auto_executed_actions']:
+                    method = action.get('recommended_method')
+                    confidence = action.get('confidence', 0.0)
+                    
+                    # Execute the action
+                    current_df, exec_log = self.healing_agent.execute_healing_action(current_df, action, method)
+                    
+                    # Log auto-execution
+                    self.db.log_agent_action(
+                        dataset_id, self.healing_agent.name,
+                        f"AUTO_EXECUTED_{action['type']}",
+                        f"Auto-executed {action['type']} (confidence: {confidence:.0%}) for column '{action.get('column', 'multiple')}' - {exec_log['message']}",
+                        "COMPLETED" if exec_log['success'] else "FAILED",
+                        human_approval="NOT_REQUIRED"
+                    )
+                    
+                    auto_executed_results.append({
+                        'action': action,
+                        'execution_log': exec_log,
+                        'confidence': confidence
+                    })
+                
+                self.db.update_agent_action(auto_exec_log_id, "COMPLETED")
+                
+                # Update quality score after auto-execution
+                if auto_executed_results:
+                    new_quality_score = self.healing_agent.recalculate_quality_score(current_df)
+                    quality_improvement = new_quality_score - quality_report['quality_score']
+                    
+                    self.db.log_agent_action(
+                        dataset_id, self.healing_agent.name,
+                        "AUTO_EXECUTION_COMPLETE",
+                        f"Auto-executed {len(auto_executed_results)} actions. Quality improved: {quality_report['quality_score']:.1f}% → {new_quality_score:.1f}% (+{quality_improvement:.1f}%)",
+                        "COMPLETED"
+                    )
+            
+            # Store auto-execution results in processing log
+            processing_log['auto_executed_actions'] = auto_executed_results
+            
+            # ========== PREPARE ACTIONS REQUIRING APPROVAL ==========
+            # Log each pending approval action
+            for i, action in enumerate(healing_plan.get('pending_approval_actions', [])):
                 action_id = self.db.log_agent_action(
                     dataset_id, self.healing_agent.name,
                     f"HEALING_PROPOSED_{action['type']}",
-                    f"Proposed {action['type']} for column '{action.get('column', 'multiple')}' affecting {action.get('affected_rows', 0)} records",
+                    f"Proposed {action['type']} (confidence: {action.get('confidence', 0):.0%}) for column '{action.get('column', 'multiple')}' affecting {action.get('affected_rows', 0)} records",
                     "PENDING_APPROVAL"
                 )
                 
@@ -644,21 +1215,14 @@ class PipelineOrchestratorAgent(ProductionAIAgent):
             )
             
             ai_summary_prompt = f"""
-            As a Pipeline Orchestrator, provide executive summary and recommendations:
+            As a Pipeline Orchestrator, provide a concise executive summary (under 50 words):
             
             Dataset: {dataset_name}
             Quality Score: {quality_report['quality_score']:.1f}/100
             Issues Found: {len(quality_report['issues'])}
             Actions Requiring Approval: {len(processing_log['human_approvals_needed'])}
             
-            Quality Issues:
-            {json.dumps(quality_report['issues'], indent=2)}
-            
-            Provide:
-            1. Executive summary (2-3 sentences)
-            2. Business impact assessment
-            3. Recommended next steps
-            4. Risk assessment
+            Provide a single paragraph summary highlighting key findings and next steps.
             """
             
             ai_summary = self.call_groq_api(ai_summary_prompt)
@@ -693,5 +1257,6 @@ class PipelineOrchestratorAgent(ProductionAIAgent):
         processing_log['end_time'] = datetime.now()
         processing_log['quality_report'] = quality_report
         processing_log['healing_plan'] = healing_plan
+        processing_log['current_df'] = current_df if 'current_df' in locals() else df  # Return df with auto-executed changes
         
         return processing_log, dataset_id

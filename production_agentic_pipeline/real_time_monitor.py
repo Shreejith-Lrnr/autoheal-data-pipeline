@@ -131,8 +131,26 @@ class RealTimeDataMonitor:
                         self._log_activity(f"🔄 Auto-fetched API: {source['SourceName']} ({record_count} records)")
                         fetches_performed += 1
                         
+                        # Log to database for UI visibility
+                        self.db.log_agent_action(
+                            dataset_id=None,
+                            agent_name="RealTimeMonitor",
+                            action_type="API_AUTO_FETCH",
+                            action_details=f"Auto-fetched {record_count} records from {source['SourceName']}",
+                            execution_status="COMPLETED"
+                        )
+                        
                     except Exception as fetch_error:
                         self._log_activity(f"❌ Auto-fetch failed for {source['SourceName']}: {str(fetch_error)}")
+                        
+                        # Log failed fetch to database
+                        self.db.log_agent_action(
+                            dataset_id=None,
+                            agent_name="RealTimeMonitor", 
+                            action_type="API_AUTO_FETCH_FAILED",
+                            action_details=f"Failed to auto-fetch from {source['SourceName']}: {str(fetch_error)}",
+                            execution_status="FAILED"
+                        )
             
             return fetches_performed
             
@@ -278,26 +296,57 @@ class RealTimeDataMonitor:
                 'quality_alerts': 0
             }
     
-    def get_recent_agent_actions(self, limit=10):
-        """Get most recent agent actions for live feed"""
+    def get_api_fetch_stats(self):
+        """Get statistics about API fetching activity"""
         try:
             conn = self.db.get_connection()
             
-            query = f"""
-                SELECT TOP {limit} AgentName, ActionType, ActionDetails, 
-                       ExecutionStatus, ActionTimestamp
-                FROM AgentActions 
-                ORDER BY ActionTimestamp DESC
-            """
+            stats = {}
             
-            df = pd.read_sql(query, conn)
+            # Total API sources
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM APISources")
+            stats['total_sources'] = cursor.fetchone()[0]
+            
+            # Active API sources
+            cursor.execute("SELECT COUNT(*) FROM APISources WHERE IsActive = 1")
+            stats['active_sources'] = cursor.fetchone()[0]
+            
+            # Total API snapshots today
+            cursor.execute("""
+                SELECT COUNT(*) FROM APISnapshots 
+                WHERE FetchedAt >= CAST(GETDATE() AS DATE)
+            """)
+            stats['snapshots_today'] = cursor.fetchone()[0]
+            
+            # Recent API fetches (last hour)
+            cursor.execute("""
+                SELECT COUNT(*) FROM AgentActions 
+                WHERE ActionType = 'API_AUTO_FETCH' 
+                AND ActionTimestamp >= DATEADD(hour, -1, GETDATE())
+            """)
+            stats['recent_fetches'] = cursor.fetchone()[0]
+            
+            # Failed fetches (last 24 hours)
+            cursor.execute("""
+                SELECT COUNT(*) FROM AgentActions 
+                WHERE ActionType = 'API_AUTO_FETCH_FAILED' 
+                AND ActionTimestamp >= DATEADD(day, -1, GETDATE())
+            """)
+            stats['failed_fetches'] = cursor.fetchone()[0]
+            
             conn.close()
-            
-            return df
+            return stats
             
         except Exception as e:
-            self._log_activity(f"❌ Error getting recent actions: {str(e)}")
-            return pd.DataFrame()
+            self._log_activity(f"❌ Error getting API stats: {str(e)}")
+            return {
+                'total_sources': 0,
+                'active_sources': 0,
+                'snapshots_today': 0,
+                'recent_fetches': 0,
+                'failed_fetches': 0
+            }
 
 # Global monitor instance
 _monitor_instance = None

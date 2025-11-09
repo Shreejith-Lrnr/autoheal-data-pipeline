@@ -225,11 +225,16 @@ class ProductionDatabase:
             conn.close()
     
     def update_dataset_quality_score(self, dataset_id, quality_score, processed_data=None, status="COMPLETED"):
-        """Update dataset with quality score and processed data"""
+        """Update dataset with quality score and processed data
+        
+        Performance optimization: If processed_data is large, to_json() conversion can be slow.
+        For incremental updates, consider using update_dataset_quality_score_fast() instead.
+        """
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
             if processed_data is not None:
+                # This is the expensive operation for large datasets
                 cursor.execute("""
                     UPDATE ProcessedData 
                     SET DataQualityScore = ?, ProcessedData = ?, Status = ?
@@ -241,6 +246,24 @@ class ProductionDatabase:
                     SET DataQualityScore = ?, Status = ?
                     WHERE ID = ?
                 """, quality_score, status, dataset_id)
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def update_dataset_quality_score_fast(self, dataset_id, quality_score, status="HEALING_IN_PROGRESS"):
+        """Fast update of quality score without storing DataFrame (for incremental updates)
+        
+        Use this during bulk approvals to avoid repeated DataFrame serialization.
+        Call update_dataset_quality_score() with the full DataFrame at the end.
+        """
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE ProcessedData 
+                SET DataQualityScore = ?, Status = ?
+                WHERE ID = ?
+            """, quality_score, status, dataset_id)
             conn.commit()
         finally:
             conn.close()
@@ -299,6 +322,41 @@ class ProductionDatabase:
         finally:
             conn.close()
     
+    def batch_log_agent_actions(self, actions_list):
+        """Batch log multiple agent actions in a single transaction (much faster)
+        
+        Args:
+            actions_list: List of dicts with keys: dataset_id, agent_name, action_type, action_details, execution_status, human_approval (optional)
+        
+        Returns:
+            List of action IDs
+        """
+        conn = self.get_connection()
+        action_ids = []
+        try:
+            cursor = conn.cursor()
+            
+            for action in actions_list:
+                cursor.execute("""
+                    INSERT INTO AgentActions (DatasetID, AgentName, ActionType, ActionDetails, ExecutionStatus, HumanApproval)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, 
+                    action['dataset_id'],
+                    action['agent_name'],
+                    action['action_type'],
+                    action['action_details'],
+                    action['execution_status'],
+                    action.get('human_approval', None)
+                )
+                action_id = cursor.execute("SELECT @@IDENTITY").fetchone()[0]
+                action_ids.append(action_id)
+            
+            # Commit all at once (single transaction)
+            conn.commit()
+            return action_ids
+        finally:
+            conn.close()
+    
     def get_dataset_summary(self):
         """Get summary of all processed datasets"""
         conn = self.get_connection()
@@ -319,21 +377,21 @@ class ProductionDatabase:
         finally:
             conn.close()
     
-    def get_agent_actions(self, dataset_id=None):
+    def get_agent_actions(self, dataset_id=None, limit=50):
         """Get agent actions log"""
         conn = self.get_connection()
         try:
             if dataset_id is None:
-                query = """
-                    SELECT AgentName, ActionType, ActionDetails, ExecutionStatus, 
+                query = f"""
+                    SELECT TOP ({limit}) AgentName, ActionType, ActionDetails, ExecutionStatus,
                            HumanApproval, ActionTimestamp
                     FROM AgentActions
                     ORDER BY ActionTimestamp DESC
                 """
                 return pd.read_sql(query, conn)
             else:
-                query = """
-                    SELECT AgentName, ActionType, ActionDetails, ExecutionStatus, 
+                query = f"""
+                    SELECT TOP ({limit}) AgentName, ActionType, ActionDetails, ExecutionStatus,
                            HumanApproval, ActionTimestamp
                     FROM AgentActions
                     WHERE DatasetID = ?
@@ -502,6 +560,20 @@ class ProductionDatabase:
         finally:
             conn.close()
 
+    def remove_api_source(self, source_id):
+        """Remove an API source and all its associated snapshots"""
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            # First delete all snapshots for this source
+            cursor.execute("DELETE FROM APISnapshots WHERE SourceID = ?", source_id)
+            # Then delete the source itself
+            cursor.execute("DELETE FROM APISources WHERE ID = ?", source_id)
+            conn.commit()
+            return cursor.rowcount > 0  # Return True if any rows were affected
+        finally:
+            conn.close()
+
     def store_api_snapshot(self, source_id, snapshot_json, snapshot_format='json', records_count=None):
         """Persist an API snapshot payload for audit and processing"""
         conn = self.get_connection()
@@ -544,6 +616,20 @@ class ProductionDatabase:
                     return snapshot_data
             else:
                 return snapshot_data
+        finally:
+            conn.close()
+
+    def get_api_snapshots_for_source(self, source_id, limit=10):
+        """Get recent snapshots for an API source for fetch history display"""
+        conn = self.get_connection()
+        try:
+            query = f"""
+                SELECT TOP ({limit}) ID, SnapshotFormat, RecordsCount, FetchedAt
+                FROM APISnapshots 
+                WHERE SourceID = ? 
+                ORDER BY FetchedAt DESC
+            """
+            return pd.read_sql(query, conn, params=[source_id])
         finally:
             conn.close()
 
