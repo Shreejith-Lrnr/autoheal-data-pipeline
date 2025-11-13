@@ -62,7 +62,7 @@ production_agentic_pipeline/
 
 1. **Install Requirements:**
 
-   ```bash
+   ```
 
    pip install -r requirements.txt
 
@@ -82,7 +82,7 @@ production_agentic_pipeline/
 
 4. **Run Application:**
 
-   ```bash
+   ```
 
    streamlit run streamlit_app.py
 
