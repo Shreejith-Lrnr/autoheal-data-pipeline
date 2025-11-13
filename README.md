@@ -58,9 +58,19 @@ production_agentic_pipeline/
 
 ## Setup Instructions
 
-  
+0. **Pull Code from Github (within terminal):**
 
-1. **Install Requirements:**
+```
+git clone https://github.com/Shreejith-Lrnr/autoheal-data-pipeline.git
+
+```
+
+```
+cd autoheal-data-pipeline
+
+```
+
+2. **Install Requirements:**
 
 ```
    
