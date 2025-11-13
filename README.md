@@ -62,11 +62,12 @@ production_agentic_pipeline/
 
 1. **Install Requirements:**
 
-   ```
-
+```
+   
    pip install -r requirements.txt
 
-   ```
+
+```
 
 2. **Setup Database:**
 
@@ -82,11 +83,11 @@ production_agentic_pipeline/
 
 4. **Run Application:**
 
-   ```
+```
 
    streamlit run streamlit_app.py
 
-   ```
+```
 
 5. **Access Application:**
 
