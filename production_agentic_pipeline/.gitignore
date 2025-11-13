@@ -48,3 +48,26 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Module Nexus (frontend)
+module-nexus/node_modules/
+module-nexus/dist/
+module-nexus/.env
+module-nexus/.vite/
+
+# Build/tool caches
+.cache/
+.vite/
+
+# Testing / typing caches
+.pytest_cache/
+.mypy_cache/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
