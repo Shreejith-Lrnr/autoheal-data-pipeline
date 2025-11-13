@@ -70,7 +70,7 @@ cd autoheal-data-pipeline
 
 ```
 
-2. **Install Requirements:**
+1. **Install Requirements:**
 
 ```
    
